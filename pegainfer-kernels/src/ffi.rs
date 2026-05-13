@@ -236,6 +236,41 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn deepseek_fp8_w1_w3_with_workspace_cuda(
+        x: *const Half,
+        w1_weight: *const u8,
+        w1_scale: *const u8,
+        w3_weight: *const u8,
+        w3_scale: *const u8,
+        gate_out: *mut Half,
+        up_out: *mut Half,
+        act: *mut u8,
+        act_bytes: usize,
+        act_scale: *mut u8,
+        act_scale_bytes: usize,
+        seq_len: i32,
+        in_dim: i32,
+        out_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_fp8_w2_swiglu_with_workspace_cuda(
+        gate: *const Half,
+        up: *const Half,
+        weight: *const u8,
+        weight_scale: *const u8,
+        out: *mut Half,
+        act: *mut u8,
+        act_bytes: usize,
+        act_scale: *mut u8,
+        act_scale_bytes: usize,
+        seq_len: i32,
+        in_dim: i32,
+        out_dim: i32,
+        limit: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn deepseek_fp4_linear_cuda(
         x: *const Half,
         weight: *const u8,
@@ -247,12 +282,19 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn deepseek_moe_fp4_grouped_linear_cuda(
+    pub fn deepseek_moe_fp4_grouped_w1_w3_with_workspace_cuda(
         x: *const Half,
-        weights: *const *const u8,
-        scales: *const *const u8,
+        w1_weights: *const *const u8,
+        w1_scales: *const *const u8,
+        w3_weights: *const *const u8,
+        w3_scales: *const *const u8,
         expert_indptr: *const i32,
-        out: *mut Half,
+        gate_out: *mut Half,
+        up_out: *mut Half,
+        act: *mut u8,
+        act_bytes: usize,
+        act_scale: *mut u8,
+        act_scale_bytes: usize,
         rows: i32,
         in_dim: i32,
         out_dim: i32,
@@ -260,8 +302,9 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn deepseek_moe_fp4_grouped_linear_with_workspace_cuda(
-        x: *const Half,
+    pub fn deepseek_moe_fp4_grouped_w2_swiglu_with_workspace_cuda(
+        gate: *const Half,
+        up: *const Half,
         weights: *const *const u8,
         scales: *const *const u8,
         expert_indptr: *const i32,
@@ -274,14 +317,6 @@ unsafe extern "C" {
         in_dim: i32,
         out_dim: i32,
         local_experts: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn deepseek_swiglu_clamp_cuda(
-        gate: *const Half,
-        up: *const Half,
-        out: *mut Half,
-        n: i32,
         limit: f32,
         stream: CUstream,
     ) -> CUresult;
@@ -356,8 +391,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn deepseek_moe_clear_bf16_cuda(data: *mut Half, n: i32, stream: CUstream) -> CUresult;
-
     pub fn deepseek_moe_reduce_fused_f32_cuda(
         expanded: *const Half,
         route_weights: *const f32,
@@ -366,15 +399,6 @@ unsafe extern "C" {
         seq_len: i32,
         hidden_dim: i32,
         topk: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn deepseek_moe_accumulate_weighted_bf16_to_f32_cuda(
-        expert_out: *const Half,
-        route_weights: *const f32,
-        route: i32,
-        out: *mut f32,
-        hidden_dim: i32,
         stream: CUstream,
     ) -> CUresult;
 
