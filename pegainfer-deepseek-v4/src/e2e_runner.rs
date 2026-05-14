@@ -105,6 +105,7 @@ pub fn run(options: &E2eOptions) -> Result<E2eSummary> {
             &options.model_path,
             EngineLoadOptions {
                 enable_cuda_graph: options.enable_cuda_graph,
+                enable_prefill_profile: false,
                 device_ordinals: options.device_ordinals.clone(),
                 seed: options.seed,
             },

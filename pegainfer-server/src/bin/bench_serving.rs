@@ -1690,6 +1690,7 @@ fn main() -> Result<()> {
                 Path::new(&cli.model_path),
                 EngineLoadOptions {
                     enable_cuda_graph: false,
+                    enable_prefill_profile: false,
                     device_ordinals: (0..8).collect(),
                     seed: command_seed(&cli),
                 },
@@ -1704,6 +1705,7 @@ fn main() -> Result<()> {
                 Path::new(&cli.model_path),
                 EngineLoadOptions {
                     enable_cuda_graph: cli.cuda_graph,
+                    enable_prefill_profile: false,
                     device_ordinals: vec![0],
                     seed: command_seed(&cli),
                 },
@@ -1718,6 +1720,7 @@ fn main() -> Result<()> {
                 Path::new(&cli.model_path),
                 EngineLoadOptions {
                     enable_cuda_graph: cli.cuda_graph,
+                    enable_prefill_profile: false,
                     device_ordinals: vec![0],
                     seed: command_seed(&cli),
                 },

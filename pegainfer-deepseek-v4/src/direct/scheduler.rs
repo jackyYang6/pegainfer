@@ -271,6 +271,13 @@ pub struct DeepSeekV4DirectGenerator {
 
 impl DeepSeekV4DirectGenerator {
     pub fn from_model_dir(model_path: &Path) -> Result<Self> {
+        Self::from_model_dir_with_prefill_profile(model_path, false)
+    }
+
+    pub fn from_model_dir_with_prefill_profile(
+        model_path: &Path,
+        enable_prefill_profile: bool,
+    ) -> Result<Self> {
         let config = Box::leak(Box::new(Config::from_model_dir(model_path).with_context(
             || {
                 format!(
@@ -279,7 +286,7 @@ impl DeepSeekV4DirectGenerator {
                 )
             },
         )?));
-        let runtime = load_full_direct_runtime(model_path, config)?;
+        let runtime = load_full_direct_runtime(model_path, config, enable_prefill_profile)?;
         Ok(Self {
             config,
             runtime,
@@ -1060,7 +1067,10 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
     thread::Builder::new()
         .name("deepseek-v4-scheduler".into())
         .spawn(move || {
-            let mut generator = match DeepSeekV4DirectGenerator::from_model_dir(&model_path) {
+            let mut generator = match DeepSeekV4DirectGenerator::from_model_dir_with_prefill_profile(
+                &model_path,
+                options.enable_prefill_profile,
+            ) {
                 Ok(generator) => {
                     let _ = init_tx.send(Ok(()));
                     generator

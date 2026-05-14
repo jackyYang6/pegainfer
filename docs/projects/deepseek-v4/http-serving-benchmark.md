@@ -53,6 +53,18 @@ $CARGO_TARGET_DIR/release/pegainfer \
   --port 18118 2>&1 | tee /tmp/dsv4_http_server.log
 ```
 
+For prefill phase attribution, start the endpoint with profiling enabled:
+
+```bash
+$CARGO_TARGET_DIR/release/pegainfer \
+  --model-path /data/DeepSeek-V4-Flash \
+  --port 18118 \
+  --deepseek-prefill-profile 2>&1 | tee /tmp/dsv4_http_server_profile.log
+```
+
+Profiling inserts CUDA synchronization around rank-0 prefill phases. Use it to
+rank phases and kernel families; use the non-profile server for serving numbers.
+
 Verify the model endpoint:
 
 ```bash
@@ -92,6 +104,23 @@ python3 scripts/bench_http_sweep.py \
   --out-dir /tmp/dsv4_http_sweep_task4
 ```
 
+Run the prompt-length sweep that feeds the prefill optimization target:
+
+```bash
+python3 scripts/bench_http_sweep.py \
+  --base-url http://127.0.0.1:18118 \
+  --model /data/DeepSeek-V4-Flash \
+  --warmup 1 \
+  --num-requests 1 \
+  --concurrency 1 \
+  --max-tokens 1 \
+  --repeats 1 \
+  --prompt-words 16,128,512,2048 \
+  --timeout 600 \
+  --server-log /tmp/dsv4_http_server_profile.log \
+  --out-dir /tmp/dsv4_http_prompt_profile_task4
+```
+
 The script is intentionally model-server agnostic at the HTTP layer. It only
 requires an OpenAI-compatible `/v1/completions` endpoint that supports streaming
 responses.
@@ -127,18 +156,58 @@ the same prompt shape and `max_tokens=16`, repeats each concurrency point three
 times, and treats per-request hash drift as a correctness failure before any
 performance interpretation.
 
-| Concurrency | Correctness | QPS (3 runs) | TTFT avg ms (3 runs) | TPOT avg ms (3 runs) | Dominant trace attribution |
+| Concurrency | Correctness | QPS (3 runs) | TTFT avg ms (3 runs) | TPOT avg ms (3 runs) | Trace attribution |
 | --- | --- | --- | --- | --- | --- |
-| `1` | pass; failed `0`, timeout `0`, combined hash `22706877075acde0` in all runs | `1.649`, `1.638`, `1.642` | `165.9`, `167.3`, `168.8` | `29.36`, `29.52`, `29.34` | admission queue avg `0.0ms`; prefill avg `~165ms` |
-| `2` | pass; failed `0`, timeout `0`, combined hash `22706877075acde0` in all runs | `1.650`, `1.649`, `1.651` | `696.8`, `697.6`, `695.9` | `29.34`, `29.34`, `29.32` | admission queue avg `~530ms`; prefill avg `~166ms` |
-| `4` | pass; failed `0`, timeout `0`, combined hash `22706877075acde0` in all runs | `1.649`, `1.646`, `1.651` | `1531.3`, `1536.2`, `1530.2` | `29.35`, `29.34`, `29.30` | admission queue avg `~1365ms`; prefill avg `~166ms` |
-| `8` | pass; failed `0`, timeout `0`, combined hash `22706877075acde0` in all runs | `1.649`, `1.648`, `1.652` | `2291.7`, `2290.4`, `2285.0` | `29.29`, `29.35`, `29.30` | admission queue avg `~2124ms`; prefill avg `~167ms` |
+| `1` | pass; failed `0`, timeout `0`, combined hash `22706877075acde0` in all runs | `1.609`, `1.613`, `1.617` | `180.7`, `177.6`, `177.7` | `29.37`, `29.49`, `29.37` | admission queue avg `~0.0ms`; prefill avg `~178ms` |
+| `2` | pass; failed `0`, timeout `0`, combined hash `22706877075acde0` in all runs | `1.620`, `1.620`, `1.622` | `717.4`, `717.9`, `716.5` | `29.34`, `29.35`, `29.33` | admission queue avg `~540ms`; prefill avg `~177ms` |
+| `4` | pass; failed `0`, timeout `0`, combined hash `22706877075acde0` in all runs | `1.618`, `1.610`, `1.620` | `1568.9`, `1574.0`, `1566.5` | `29.36`, `29.58`, `29.35` | admission queue avg `~1392ms`; prefill avg `~177ms` |
+| `8` | pass; failed `0`, timeout `0`, combined hash `22706877075acde0` in all runs | `1.618`, `1.619`, `1.620` | `2338.6`, `2342.3`, `2339.4` | `29.38`, `29.36`, `29.38` | admission queue avg `~2162ms`; prefill avg `~177ms` |
 
-Trace attribution shows that the c1 to c8 TTFT increase is dominated by
-admission queue time under the current HTTP serving path, while `prefill_ms`,
-`first_decode_ms`, `stream_flush_ms`, and TPOT remain roughly stable. This is
-diagnostic evidence for the current single-request scheduler turn used by HTTP
-serving; it is not a throughput optimization result.
+Trace attribution separates two different bottlenecks:
+
+- Absolute single-request service time is still high. At concurrency `1`, TTFT
+  is already `~178ms` and is dominated by DSV4 direct prefill plus decode-cache
+  seeding. Each request then spends roughly `15 * 29ms` on remaining decode
+  tokens, so the current endpoint tops out near `1.6` requests/s before any
+  queueing analysis.
+- Increasing concurrency mostly adds admission queue time because HTTP serving
+  currently uses a single-request scheduler turn after the correctness fallback.
+  The sweep shows queue time growing from `0ms` at c1 to `~2162ms` at c8, while
+  prefill, first-decode, stream flush, and TPOT stay roughly stable.
+
+The evidence therefore points to prefill/decode kernel service time as the next
+performance target, with admission queue time as the concurrency amplification
+of that baseline. This PR only adds the trace/sweep gate; it is not a throughput
+optimization result.
+
+### P1 Prompt-Length And Prefill Profile
+
+Prompt-length sweep, measured with profiling enabled and `max_tokens=1`, shows
+TTFT tracking DSV4 direct prefill time:
+
+| Prompt words | Prompt tokens | QPS | TTFT avg ms | Prefill avg ms | failed / timeout |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `16` | `22` | `5.433` | `183.6` | `181.7` | `0 / 0` |
+| `128` | `164-165` | `4.243` | `235.3` | `234.5` | `0 / 0` |
+| `512` | `660-661` | `2.637` | `378.9` | `378.0` | `0 / 0` |
+| `2048` | `2644-2645` | `0.758` | `1318.2` | `1316.9` | `0 / 0` |
+| `8192` | `10580` | `0.111` | `9029.0` | `9014.0` | `0 / 0` |
+
+Rank-0 prefill profile records show `block_prefill` dominates the profiled
+prefill window. The table groups block-prefill time by DSV4 compress ratio:
+
+| Prompt tokens | Profiled prefill ms | `block_prefill` ms | ratio `0` ms | ratio `4` ms | ratio `128` ms | Top block-prefill layers |
+| ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `22` | `150.4` | `149.6` | `5.1` | `80.9` | `63.6` | ratio-4 layers around `4-5ms` each |
+| `165` | `203.2` | `202.3` | `8.7` | `100.2` | `93.4` | ratio-4/128 layers around `5-6ms` each |
+| `661` | `343.0` | `342.2` | `15.3` | `200.7` | `126.2` | ratio-4 layers around `10ms` each |
+| `2645` | `1266.2` | `1260.3` | `37.9` | `818.6` | `403.9` | ratio-4 layers around `39-40ms` each |
+| `10580` | `8956.7` | `8940.6` | `134.8` | `6902.4` | `1903.3` | ratio-4 layers dominate, top layer `~500ms` |
+
+This points the first optimization target at ratio-4 `block_prefill`, especially
+the compressed attention / indexer / compressor path. A candidate reuse of the
+ratio-4 indexer compressed KV was evaluated and rejected because it changed the
+HTTP output hash gate; it is not included in this PR.
 
 ## Boundary
 

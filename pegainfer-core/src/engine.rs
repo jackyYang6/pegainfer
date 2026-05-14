@@ -7,6 +7,7 @@ use crate::sampler::SamplingParams;
 #[derive(Clone, Debug)]
 pub struct EngineLoadOptions {
     pub enable_cuda_graph: bool,
+    pub enable_prefill_profile: bool,
     pub device_ordinals: Vec<usize>,
     pub seed: u64,
 }
@@ -15,6 +16,7 @@ impl Default for EngineLoadOptions {
     fn default() -> Self {
         Self {
             enable_cuda_graph: true,
+            enable_prefill_profile: false,
             device_ordinals: vec![0],
             seed: 42,
         }

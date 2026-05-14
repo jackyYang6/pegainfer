@@ -29,8 +29,14 @@ def request_hashes(report: dict[str, Any]) -> list[str]:
     return [request["output_hash"] for request in report["requests"] if request["ok"]]
 
 
-def run_one(args: argparse.Namespace, concurrency: int, max_tokens: int, repeat: int) -> dict[str, Any]:
-    out = args.out_dir / f"c{concurrency}_mt{max_tokens}_r{repeat}.json"
+def run_one(
+    args: argparse.Namespace,
+    prompt_words: int,
+    concurrency: int,
+    max_tokens: int,
+    repeat: int,
+) -> dict[str, Any]:
+    out = args.out_dir / f"pw{prompt_words}_c{concurrency}_mt{max_tokens}_r{repeat}.json"
     cmd = [
         sys.executable,
         str(BENCH),
@@ -45,7 +51,7 @@ def run_one(args: argparse.Namespace, concurrency: int, max_tokens: int, repeat:
         "--warmup",
         str(args.warmup),
         "--prompt-words",
-        str(args.prompt_words),
+        str(prompt_words),
         "--max-tokens",
         str(max_tokens),
         "--temperature",
@@ -64,15 +70,15 @@ def run_one(args: argparse.Namespace, concurrency: int, max_tokens: int, repeat:
 
 
 def build_summary(args: argparse.Namespace, reports: list[dict[str, Any]]) -> dict[str, Any]:
-    cells: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    cells: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
     for report in reports:
         workload = report["workload"]
-        key = (workload["concurrency"], workload["max_tokens"])
+        key = (workload["prompt_words"], workload["concurrency"], workload["max_tokens"])
         cells.setdefault(key, []).append(report)
 
     rows = []
     correctness_ok = True
-    for (concurrency, max_tokens), cell_reports in sorted(cells.items()):
+    for (prompt_words, concurrency, max_tokens), cell_reports in sorted(cells.items()):
         baseline = request_hashes(cell_reports[0])
         stable = True
         for report in cell_reports:
@@ -84,6 +90,7 @@ def build_summary(args: argparse.Namespace, reports: list[dict[str, Any]]) -> di
         rows.append(
             {
                 "concurrency": concurrency,
+                "prompt_words": prompt_words,
                 "max_tokens": max_tokens,
                 "repeats": len(cell_reports),
                 "stable_per_request_hashes": stable,
@@ -124,7 +131,7 @@ def build_summary(args: argparse.Namespace, reports: list[dict[str, Any]]) -> di
         },
         "correctness_gate": {
             "passed": correctness_ok,
-            "rule": "failed=0, timeout=0, and per-request output_hash list stable across repeats for each concurrency/max_tokens cell",
+            "rule": "failed=0, timeout=0, and per-request output_hash list stable across repeats for each prompt_words/concurrency/max_tokens cell",
         },
         "rows": rows,
     }
@@ -136,7 +143,7 @@ def main() -> None:
     parser.add_argument("--model", required=True)
     parser.add_argument("--num-requests", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=2)
-    parser.add_argument("--prompt-words", type=int, default=16)
+    parser.add_argument("--prompt-words", type=parse_int_list, default=[16])
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--timeout", type=float, default=240.0)
     parser.add_argument("--no-ignore-eos", action="store_true")
@@ -152,10 +159,11 @@ def main() -> None:
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     reports = []
-    for max_tokens in args.max_tokens:
-        for concurrency in args.concurrency:
-            for repeat in range(args.repeats):
-                reports.append(run_one(args, concurrency, max_tokens, repeat))
+    for prompt_words in args.prompt_words:
+        for max_tokens in args.max_tokens:
+            for concurrency in args.concurrency:
+                for repeat in range(args.repeats):
+                    reports.append(run_one(args, prompt_words, concurrency, max_tokens, repeat))
 
     summary = build_summary(args, reports)
     (args.out_dir / "sweep_summary.json").write_text(

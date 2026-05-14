@@ -194,6 +194,7 @@ fn regen_test_data_qwen35() {
         Path::new(&model_path),
         EngineLoadOptions {
             enable_cuda_graph: true,
+            enable_prefill_profile: false,
             device_ordinals: vec![0],
             seed: 42,
         },
