@@ -49,10 +49,8 @@ pub(super) fn load_layer_forward_cache(
                 "attention_q_a_norm",
             )?,
         )?,
-        q_b_proj: GpuWeight::from_device_matrix(
-            raw_tensor(weights, &layer.attention.q_b_proj)?
-                .copy_bf16_matrix_from_shape(ctx, "attention_q_b_proj")?,
-        )?,
+        q_b_proj: raw_tensor(weights, &layer.attention.q_b_proj)?
+            .copy_bf16_matrix_from_shape(ctx, "attention_q_b_proj")?,
         kv_a_norm: NormWeight::from_device_vec(
             raw_tensor(weights, &layer.attention.kv_a_layernorm)?.copy_bf16_vec(
                 ctx,
@@ -60,14 +58,10 @@ pub(super) fn load_layer_forward_cache(
                 "attention_kv_a_norm",
             )?,
         )?,
-        kv_b_proj: GpuWeight::from_device_matrix(
-            raw_tensor(weights, &layer.attention.kv_b_proj)?
-                .copy_bf16_matrix_from_shape(ctx, "attention_kv_b_proj")?,
-        )?,
-        o_proj: GpuWeight::from_device_matrix(
-            raw_tensor(weights, &layer.attention.o_proj)?
-                .copy_bf16_matrix_from_shape(ctx, "attention_o_proj")?,
-        )?,
+        kv_b_proj: raw_tensor(weights, &layer.attention.kv_b_proj)?
+            .copy_bf16_matrix_from_shape(ctx, "attention_kv_b_proj")?,
+        o_proj: raw_tensor(weights, &layer.attention.o_proj)?
+            .copy_bf16_matrix_from_shape(ctx, "attention_o_proj")?,
         post_attention_norm: NormWeight::from_device_vec(
             raw_tensor(weights, &layer.attention.post_attention_layernorm)?.copy_bf16_vec(
                 ctx,
@@ -86,19 +80,10 @@ pub(super) fn load_layer_forward_cache(
             let down_proj = raw_tensor(weights, &mlp.down_proj)?
                 .copy_bf16_matrix_from_shape(ctx, "dense_down_proj")?;
             ensure_dense_mlp_shapes("dense_mlp", &gate_proj, &up_proj, &down_proj)?;
-            ensure!(
-                gate_proj.rows == KIMI_K2_DENSE_INTERMEDIATE / 8,
-                "dense gate local rows must be {}, got {}",
-                KIMI_K2_DENSE_INTERMEDIATE / 8,
-                gate_proj.rows
-            );
-            let gate_up_proj = GpuWeight::from_device_matrix(DeviceMatrix::vstack(
-                &device_ctx,
-                &[&gate_proj, &up_proj],
-            )?)?;
+            let gate_up_proj = DeviceMatrix::vstack(&device_ctx, &[&gate_proj, &up_proj])?;
             KimiLayerForwardKindCache::Dense(KimiDenseForwardCache {
                 gate_up_proj,
-                down_proj: GpuWeight::from_device_matrix(down_proj)?,
+                down_proj,
             })
         }
         KimiLayerWeightKindNames::Moe(moe) => {
@@ -119,14 +104,12 @@ pub(super) fn load_layer_forward_cache(
                 &shared_up_proj,
                 &shared_down_proj,
             )?;
-            let shared_gate_up_proj = GpuWeight::from_device_matrix(DeviceMatrix::vstack(
-                &device_ctx,
-                &[&shared_gate_proj, &shared_up_proj],
-            )?)?;
+            let shared_gate_up_proj =
+                DeviceMatrix::vstack(&device_ctx, &[&shared_gate_proj, &shared_up_proj])?;
             KimiLayerForwardKindCache::Moe(KimiMoeForwardCache {
                 router,
                 shared_gate_up_proj,
-                shared_down_proj: GpuWeight::from_device_matrix(shared_down_proj)?,
+                shared_down_proj,
             })
         }
     };

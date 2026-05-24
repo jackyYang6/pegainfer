@@ -86,6 +86,12 @@ impl KimiK2WeightManifest {
         Ok(manifest)
     }
 
+    pub fn with_parallel_shape(mut self, shape: KimiK2ParallelShape) -> Result<Self> {
+        self.parallel = shape;
+        self.validate()?;
+        Ok(self)
+    }
+
     pub fn validate(&self) -> Result<()> {
         ensure!(
             self.layers.len() == KIMI_K2_LAYERS,
@@ -102,29 +108,33 @@ impl KimiK2WeightManifest {
             "Kimi manifest expected {KIMI_K2_MOE_LAYERS} MoE layers, got {moe_layers}"
         );
         ensure!(
-            self.parallel.tp_world == 8 && self.parallel.ep_world == 8,
-            "Kimi manifest currently supports TP8/EP8 only"
-        );
-        ensure!(
-            KIMI_K2_ROUTED_EXPERTS % self.parallel.ep_world == 0,
-            "routed expert count must divide EP world"
+            self.parallel.ep_world > 0
+                && KIMI_K2_ROUTED_EXPERTS % self.parallel.ep_world == 0
+                && crate::config::KIMI_K2_HEADS % self.parallel.tp_world == 0
+                && crate::config::KIMI_K2_VOCAB % self.parallel.tp_world == 0,
+            "Kimi parallel shape TP{}/DP{}/EP{} does not evenly divide model dimensions",
+            self.parallel.tp_world,
+            self.parallel.dp_world,
+            self.parallel.ep_world
         );
         Ok(())
     }
 
     pub fn rank_plan(&self, rank: usize) -> Result<KimiRankWeightPlan> {
         ensure!(
-            rank < self.parallel.tp_world && rank < self.parallel.ep_world,
-            "Kimi rank {rank} outside TP{} / EP{}",
-            self.parallel.tp_world,
+            rank < self.parallel.ep_world,
+            "Kimi rank {rank} outside EP{}",
             self.parallel.ep_world
         );
+        let coord = self.parallel.parallel_config().coord(rank);
+        let tp_rank = coord.tp_rank;
+        let ep_rank = coord.ep_rank;
         let attention_head_range =
-            rank * self.parallel.heads_per_tp..(rank + 1) * self.parallel.heads_per_tp;
+            tp_rank * self.parallel.heads_per_tp..(tp_rank + 1) * self.parallel.heads_per_tp;
         let vocab_range =
-            rank * self.parallel.vocab_per_tp..(rank + 1) * self.parallel.vocab_per_tp;
+            tp_rank * self.parallel.vocab_per_tp..(tp_rank + 1) * self.parallel.vocab_per_tp;
         let local_expert_range =
-            rank * self.parallel.local_experts..(rank + 1) * self.parallel.local_experts;
+            ep_rank * self.parallel.local_experts..(ep_rank + 1) * self.parallel.local_experts;
         let names = self.rank_tensor_names(rank)?;
         let shard_count = names
             .iter()
@@ -133,8 +143,8 @@ impl KimiK2WeightManifest {
             .len();
         Ok(KimiRankWeightPlan {
             rank,
-            tp_rank: rank,
-            ep_rank: rank,
+            tp_rank,
+            ep_rank,
             attention_head_range,
             vocab_range,
             local_expert_range,
@@ -347,12 +357,13 @@ impl KimiK2WeightManifest {
     }
 
     pub fn rank_local_expert_range(&self, rank: usize) -> Result<Range<usize>> {
+        let ep_rank = self.parallel.parallel_config().coord(rank).ep_rank;
         ensure!(
-            rank < self.parallel.ep_world,
-            "Kimi EP rank {rank} outside EP{}",
+            ep_rank < self.parallel.ep_world,
+            "Kimi EP rank {ep_rank} outside EP{}",
             self.parallel.ep_world
         );
-        Ok(rank * self.parallel.local_experts..(rank + 1) * self.parallel.local_experts)
+        Ok(ep_rank * self.parallel.local_experts..(ep_rank + 1) * self.parallel.local_experts)
     }
 }
 

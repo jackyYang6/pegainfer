@@ -67,6 +67,7 @@ impl KimiWorkerDecodeArena {
         batch_size: usize,
         page_size: usize,
         vocab_rows: usize,
+        dims: &crate::config::KimiLocalDims,
     ) -> Result<Self> {
         ensure!(num_layers > 0, "Kimi decode arena needs layers");
         ensure!(
@@ -136,7 +137,7 @@ impl KimiWorkerDecodeArena {
             cos_d: ctx.stream.clone_htod(&cos_host)?,
             sin_d: ctx.stream.clone_htod(&sin_host)?,
             layer_caches,
-            scratch: KimiWorkerDecodeScratch::new(ctx, batch_size)?,
+            scratch: KimiWorkerDecodeScratch::new(ctx, batch_size, dims)?,
             logits: HiddenStates::zeros(ctx, vocab_rows, batch_size)?,
             graph: CudaGraphState::new(),
         })
@@ -393,7 +394,11 @@ pub(super) fn build_decode_append_page_metadata(
 }
 
 impl KimiWorkerDecodeScratch {
-    pub(super) fn new(ctx: &DeviceContext, batch_size: usize) -> Result<Self> {
+    pub(super) fn new(
+        ctx: &DeviceContext,
+        batch_size: usize,
+        dims: &crate::config::KimiLocalDims,
+    ) -> Result<Self> {
         let marlin_block_size = kimi_marlin_block_size(batch_size);
         let marlin_route_workspace =
             KimiMarlinRouteWorkspace::new(ctx, batch_size, marlin_block_size)?;
@@ -404,9 +409,11 @@ impl KimiWorkerDecodeScratch {
             marlin_block_size,
         )?;
         Ok(Self {
-            mla: crate::typed_scratch::MlaDecodeScratch::new(ctx, batch_size)?,
-            dense_mlp: crate::typed_scratch::DenseMlpDecodeScratch::new(ctx, batch_size)?,
-            shared_expert: crate::typed_scratch::SharedExpertDecodeScratch::new(ctx, batch_size)?,
+            mla: crate::typed_scratch::MlaDecodeScratch::new(ctx, batch_size, dims)?,
+            dense_mlp: crate::typed_scratch::DenseMlpDecodeScratch::new(ctx, batch_size, dims)?,
+            shared_expert: crate::typed_scratch::SharedExpertDecodeScratch::new(
+                ctx, batch_size, dims,
+            )?,
             router: crate::typed_scratch::RouterScratch::new(ctx, batch_size)?,
             marlin: crate::typed_scratch::MarlinExpertScratch::new(ctx, batch_size)?,
             marlin_route_workspace,

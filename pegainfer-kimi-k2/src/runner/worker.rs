@@ -7,7 +7,7 @@ use std::{
     thread,
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use cudarc::nccl::{
     ReduceOp,
@@ -18,18 +18,16 @@ use pegainfer_core::cuda_graph::CudaGraphState;
 use pegainfer_core::ops::call_trace;
 use pegainfer_kernels::{
     ops::{
-        KIMI_K2_MLA_KV_A_OUT, KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8, KIMI_K2_MLA_KV_LORA_RANK,
-        KIMI_K2_MLA_LOCAL_HEADS_TP8, KIMI_K2_MLA_O_LOCAL_IN_TP8, KIMI_K2_MLA_Q_HEAD_DIM,
-        KIMI_K2_MLA_Q_LOCAL_OUT_TP8, KIMI_K2_MLA_QKV_A_OUT, KIMI_K2_MLA_ROPE_DIM,
-        KIMI_K2_MLA_V_HEAD_DIM, KIMI_K2_ROUTER_SCALE, KimiMarlinRouteWorkspace,
-        KimiMarlinWna16Workspace, KimiMlaPagedKvLayout, KimiRouterBatch, KimiRouterConfig,
-        KimiRouterOutput, KimiRouterScratch, flashinfer_topk_row_states_bytes,
-        kimi_add_f32_bf16_to_bf16, kimi_flashinfer_batch_decode_mla,
-        kimi_flashinfer_single_prefill_mla, kimi_marlin_sum_topk_rows_f32, kimi_marlin_w13_swiglu,
-        kimi_marlin_wna16_w2_gemm, kimi_marlin_wna16_w13_gemm, kimi_mla_absorb_q_nope,
-        kimi_mla_paged_kv_append, kimi_mla_rope_apply_kpe, kimi_mla_rope_assemble_prefill,
-        kimi_mla_rope_split_decode, kimi_mla_split_qkv_a, kimi_mla_v_up,
-        kimi_moe_marlin_align_block_size, kimi_router_noaux_tc_launch,
+        KIMI_K2_MLA_KV_A_OUT, KIMI_K2_MLA_KV_LORA_RANK, KIMI_K2_MLA_Q_HEAD_DIM,
+        KIMI_K2_MLA_QKV_A_OUT, KIMI_K2_MLA_ROPE_DIM, KIMI_K2_MLA_V_HEAD_DIM, KIMI_K2_ROUTER_SCALE,
+        KimiMarlinRouteWorkspace, KimiMarlinWna16Workspace, KimiMlaPagedKvLayout, KimiRouterBatch,
+        KimiRouterConfig, KimiRouterOutput, KimiRouterScratch, flashinfer_topk_row_states_bytes,
+        kimi_add_f32_bf16_to_bf16, kimi_flashinfer_batch_decode_mla_rt,
+        kimi_flashinfer_single_prefill_mla_rt, kimi_marlin_sum_topk_rows_f32,
+        kimi_marlin_w13_swiglu, kimi_marlin_wna16_w2_gemm, kimi_marlin_wna16_w13_gemm,
+        kimi_mla_absorb_q_nope_rt, kimi_mla_paged_kv_append, kimi_mla_rope_apply_kpe,
+        kimi_mla_rope_assemble_prefill_rt, kimi_mla_rope_split_decode_rt, kimi_mla_split_qkv_a,
+        kimi_mla_v_up_rt, kimi_moe_marlin_align_block_size, kimi_router_noaux_tc_launch,
         kimi_scaled_add_f32_bf16_to_bf16, repeat_f32_for_reduce_scatter_into, scale_f32_in_place,
     },
     tensor::{
@@ -40,11 +38,10 @@ use pegainfer_kernels::{
 
 use crate::{
     config::{
-        KIMI_K2_DENSE_INTERMEDIATE, KIMI_K2_DENSE_LAYERS, KIMI_K2_EXPERT_INTERMEDIATE,
-        KIMI_K2_HIDDEN, KIMI_K2_LAYERS, KIMI_K2_MOE_LAYERS, KIMI_K2_Q_LORA_RANK,
-        KIMI_K2_QK_ROPE_HEAD_DIM, KIMI_K2_RMS_NORM_EPS, KIMI_K2_ROPE_THETA, KIMI_K2_ROUTED_EXPERTS,
-        KIMI_K2_TOPK, KIMI_K2_YARN_BETA_FAST, KIMI_K2_YARN_BETA_SLOW, KIMI_K2_YARN_FACTOR,
-        KIMI_K2_YARN_ORIGINAL_MAX_POS,
+        KIMI_K2_DENSE_LAYERS, KIMI_K2_EXPERT_INTERMEDIATE, KIMI_K2_HIDDEN, KIMI_K2_LAYERS,
+        KIMI_K2_MOE_LAYERS, KIMI_K2_Q_LORA_RANK, KIMI_K2_QK_ROPE_HEAD_DIM, KIMI_K2_RMS_NORM_EPS,
+        KIMI_K2_ROPE_THETA, KIMI_K2_ROUTED_EXPERTS, KIMI_K2_TOPK, KIMI_K2_YARN_BETA_FAST,
+        KIMI_K2_YARN_BETA_SLOW, KIMI_K2_YARN_FACTOR, KIMI_K2_YARN_ORIGINAL_MAX_POS,
     },
     layers::experts::{KIMI_K2_EP_WORLD, KIMI_K2_EP8_LOCAL_EXPERTS},
     runner::affinity::{KimiRankThreadPlacement, pin_rank_worker_thread},
@@ -56,10 +53,7 @@ use crate::{
     },
 };
 
-pub(super) use crate::typed_scratch::{
-    DENSE_ACTIVATED_DIM, DENSE_GATE_UP_DIM, KimiWorkerDecodeScratch, MARLIN_W13_OUT_DIM,
-    SHARED_ACTIVATED_DIM, SHARED_GATE_UP_DIM,
-};
+pub(super) use crate::typed_scratch::{KimiWorkerDecodeScratch, MARLIN_W13_OUT_DIM};
 
 const KIMI_MARLIN_MAX_BLOCK_SIZE: usize = 64;
 const KIMI_DECODE_MAX_BATCH: usize = 4;
@@ -123,6 +117,7 @@ enum KimiRankCommand {
         slot: usize,
         decode_batch_size: usize,
         input_ids: Vec<u32>,
+        ep_max_seq_len: usize,
         resp: SyncSender<Result<KimiOneTokenForwardReport>>,
     },
     ForwardDecodeBatchNextTokens {
@@ -142,11 +137,6 @@ enum KimiRankCommand {
 
 pub(super) struct KimiRankWorker {
     placement: KimiK2RankPlacement,
-    weight_plan: KimiRankWeightPlan,
-    weight_names: KimiRankWeightNames,
-    shard_plan: KimiRankShardPlan,
-    sliced_load_plan: KimiRankSlicedLoadPlan,
-    thread_placement: KimiRankThreadPlacement,
     tx: Sender<KimiRankCommand>,
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -159,6 +149,7 @@ impl KimiRankWorker {
         shard_plan: KimiRankShardPlan,
         sliced_load_plan: KimiRankSlicedLoadPlan,
         thread_placement: KimiRankThreadPlacement,
+        local_dims: crate::config::KimiLocalDims,
         ctx: KimiRankGpuContext,
         collective_barrier: Arc<Barrier>,
         enable_cuda_graph: bool,
@@ -208,6 +199,7 @@ impl KimiRankWorker {
                     worker_ctx,
                     worker_weight_names,
                     worker_sliced_load_plan,
+                    local_dims,
                     worker_collective_barrier,
                     enable_cuda_graph,
                 ) {
@@ -226,11 +218,6 @@ impl KimiRankWorker {
             .map_err(|_| anyhow::anyhow!("Kimi-K2 rank worker exited during startup"))??;
         Ok(Self {
             placement,
-            weight_plan,
-            weight_names,
-            shard_plan,
-            sliced_load_plan,
-            thread_placement,
             tx,
             handle: Some(handle),
         })
@@ -238,26 +225,6 @@ impl KimiRankWorker {
 
     pub(super) fn placement(&self) -> KimiK2RankPlacement {
         self.placement
-    }
-
-    pub(super) fn weight_plan(&self) -> &KimiRankWeightPlan {
-        &self.weight_plan
-    }
-
-    pub(super) fn weight_names(&self) -> &KimiRankWeightNames {
-        &self.weight_names
-    }
-
-    pub(super) fn shard_plan(&self) -> &KimiRankShardPlan {
-        &self.shard_plan
-    }
-
-    pub(super) fn sliced_load_plan(&self) -> &KimiRankSlicedLoadPlan {
-        &self.sliced_load_plan
-    }
-
-    pub(super) fn thread_placement(&self) -> &KimiRankThreadPlacement {
-        &self.thread_placement
     }
 
     pub(super) fn load_sliced_weights_async(
@@ -295,6 +262,7 @@ impl KimiRankWorker {
         input_ids: Vec<u32>,
         slot: usize,
         decode_batch_size: usize,
+        ep_max_seq_len: usize,
     ) -> Result<Receiver<Result<KimiOneTokenForwardReport>>> {
         let (resp_tx, resp_rx) = mpsc::sync_channel(1);
         self.tx
@@ -302,6 +270,7 @@ impl KimiRankWorker {
                 slot,
                 decode_batch_size,
                 input_ids,
+                ep_max_seq_len,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("Kimi-K2 rank worker channel closed"))?;
@@ -371,6 +340,7 @@ struct KimiRankThreadState {
     tp_comm: Option<OwnedRankComm>,
     weight_names: KimiRankWeightNames,
     sliced_load_plan: KimiRankSlicedLoadPlan,
+    local_dims: crate::config::KimiLocalDims,
     collective_barrier: Arc<Barrier>,
     enable_cuda_graph: bool,
     weight_report: Option<KimiRankWeightLoadReport>,
@@ -405,7 +375,11 @@ struct KimiWorkerDecodeArenas {
 }
 
 impl KimiWorkerDecodeArenas {
-    fn new(ctx: &DeviceContext, vocab_rows: usize) -> Result<Self> {
+    fn new(
+        ctx: &DeviceContext,
+        vocab_rows: usize,
+        dims: &crate::config::KimiLocalDims,
+    ) -> Result<Self> {
         let mut arenas = Vec::with_capacity(KIMI_DECODE_MAX_BATCH);
         for batch_size in 1..=KIMI_DECODE_MAX_BATCH {
             arenas.push(
@@ -415,6 +389,7 @@ impl KimiWorkerDecodeArenas {
                     batch_size,
                     KIMI_DECODE_PAGE_SIZE,
                     vocab_rows,
+                    dims,
                 )
                 .with_context(|| format!("failed to allocate Kimi bs{batch_size} decode arena"))?,
             );
@@ -450,10 +425,10 @@ struct KimiAttentionForwardCache {
     input_norm: NormWeight<KIMI_K2_HIDDEN>,
     fused_qkv_a_proj: GpuWeight<KIMI_K2_MLA_QKV_A_OUT, KIMI_K2_HIDDEN>,
     q_a_norm: NormWeight<KIMI_K2_Q_LORA_RANK>,
-    q_b_proj: GpuWeight<KIMI_K2_MLA_Q_LOCAL_OUT_TP8, KIMI_K2_Q_LORA_RANK>,
+    q_b_proj: DeviceMatrix,
     kv_a_norm: NormWeight<KIMI_K2_MLA_KV_LORA_RANK>,
-    kv_b_proj: GpuWeight<KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8, KIMI_K2_MLA_KV_LORA_RANK>,
-    o_proj: GpuWeight<KIMI_K2_HIDDEN, KIMI_K2_MLA_O_LOCAL_IN_TP8>,
+    kv_b_proj: DeviceMatrix,
+    o_proj: DeviceMatrix,
     post_attention_norm: NormWeight<KIMI_K2_HIDDEN>,
 }
 
@@ -463,14 +438,14 @@ enum KimiLayerForwardKindCache {
 }
 
 struct KimiDenseForwardCache {
-    gate_up_proj: GpuWeight<DENSE_GATE_UP_DIM, KIMI_K2_HIDDEN>,
-    down_proj: GpuWeight<KIMI_K2_HIDDEN, DENSE_ACTIVATED_DIM>,
+    gate_up_proj: DeviceMatrix,
+    down_proj: DeviceMatrix,
 }
 
 pub(super) struct KimiMoeForwardCache {
     pub(super) router: KimiRouterDeviceWeights,
-    pub(super) shared_gate_up_proj: GpuWeight<SHARED_GATE_UP_DIM, KIMI_K2_HIDDEN>,
-    pub(super) shared_down_proj: GpuWeight<KIMI_K2_HIDDEN, SHARED_ACTIVATED_DIM>,
+    pub(super) shared_gate_up_proj: DeviceMatrix,
+    pub(super) shared_down_proj: DeviceMatrix,
 }
 
 struct KimiWorkerDecodeArena {
@@ -515,6 +490,7 @@ fn bind_rank_thread(
     ctx: KimiRankGpuContext,
     weight_names: KimiRankWeightNames,
     sliced_load_plan: KimiRankSlicedLoadPlan,
+    local_dims: crate::config::KimiLocalDims,
     collective_barrier: Arc<Barrier>,
     enable_cuda_graph: bool,
 ) -> Result<KimiRankThreadState> {
@@ -540,6 +516,7 @@ fn bind_rank_thread(
         tp_comm: None,
         weight_names,
         sliced_load_plan,
+        local_dims,
         collective_barrier,
         enable_cuda_graph,
         weight_report: None,
@@ -570,9 +547,15 @@ fn rank_worker_loop(rx: Receiver<KimiRankCommand>, mut state: KimiRankThreadStat
                 slot,
                 decode_batch_size,
                 input_ids,
+                ep_max_seq_len,
                 resp,
             } => {
-                let result = state.forward_prompt_next_token(slot, decode_batch_size, &input_ids);
+                let result = state.forward_prompt_next_token(
+                    slot,
+                    decode_batch_size,
+                    &input_ids,
+                    ep_max_seq_len,
+                );
                 let _ = resp.send(result);
             }
             KimiRankCommand::ForwardDecodeBatchNextTokens {
@@ -604,7 +587,7 @@ mod cache;
 mod load;
 mod runtime;
 #[cfg(feature = "pplx-ep")]
-pub(super) use runtime::all_reduce_hidden_via_f32_in_place;
+pub(super) use runtime::maybe_all_reduce_hidden_via_f32_in_place;
 mod state;
 
 #[cfg(feature = "pplx-ep")]
@@ -634,15 +617,11 @@ impl KimiRankWeightLoadReport {
     }
 }
 
-pub(super) fn build_tp8_ep8_placements(
-    device_ordinals: &[usize],
-) -> Result<Vec<KimiK2RankPlacement>> {
-    if device_ordinals.len() != 8 {
-        bail!(
-            "Kimi-K2 TP8/EP8 requires exactly 8 device ordinals, got {:?}",
-            device_ordinals
-        );
-    }
+pub(super) fn build_placements(device_ordinals: &[usize]) -> Result<Vec<KimiK2RankPlacement>> {
+    ensure!(
+        !device_ordinals.is_empty(),
+        "Kimi-K2 requires at least one device ordinal"
+    );
     device_ordinals
         .iter()
         .copied()

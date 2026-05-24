@@ -9,6 +9,7 @@ pub mod kv_pool;
 pub mod logging;
 pub mod ops;
 pub mod page_pool;
+pub mod parallel;
 pub mod sampler;
 pub mod tensor;
 pub mod weight_loader;

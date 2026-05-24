@@ -379,8 +379,9 @@ int kimi_mla_absorb_q_nope_cuda(const DType* kv_b_proj,
                                 const DType* q_nope,
                                 DType* q_abs_nope,
                                 int batch_size,
+                                int local_heads,
                                 cudaStream_t stream) {
-  if (batch_size <= 0) {
+  if (batch_size <= 0 || local_heads <= 0) {
     return static_cast<int>(cudaErrorInvalidValue);
   }
   if (g_cublas_handle == nullptr) {
@@ -411,14 +412,14 @@ int kimi_mla_absorb_q_nope_cuda(const DType* kv_b_proj,
       /*strideA=*/static_cast<long long>(kKvBHeadDim) * kKvLoraRank,
       q_nope,
       CUDA_R_16BF,
-      /*ldb=*/kLocalHeads * kNopeDim,
+      /*ldb=*/local_heads * kNopeDim,
       /*strideB=*/kNopeDim,
       &beta,
       q_abs_nope,
       CUDA_R_16BF,
-      /*ldc=*/kLocalHeads * kKvLoraRank,
+      /*ldc=*/local_heads * kKvLoraRank,
       /*strideC=*/kKvLoraRank,
-      /*batchCount=*/kLocalHeads,
+      /*batchCount=*/local_heads,
       CUBLAS_COMPUTE_32F,
       CUBLAS_GEMM_DEFAULT_TENSOR_OP);
   return status == CUBLAS_STATUS_SUCCESS ? 0 : static_cast<int>(cudaErrorUnknown);
@@ -428,8 +429,9 @@ int kimi_mla_v_up_cuda(const DType* kv_b_proj,
                        const DType* latent,
                        DType* output,
                        int batch_size,
+                       int local_heads,
                        cudaStream_t stream) {
-  if (batch_size <= 0) {
+  if (batch_size <= 0 || local_heads <= 0) {
     return static_cast<int>(cudaErrorInvalidValue);
   }
   if (g_cublas_handle == nullptr) {
@@ -458,14 +460,14 @@ int kimi_mla_v_up_cuda(const DType* kv_b_proj,
       /*strideA=*/static_cast<long long>(kKvBHeadDim) * kKvLoraRank,
       latent,
       CUDA_R_16BF,
-      /*ldb=*/kLocalHeads * kKvLoraRank,
+      /*ldb=*/local_heads * kKvLoraRank,
       /*strideB=*/kKvLoraRank,
       &beta,
       output,
       CUDA_R_16BF,
-      /*ldc=*/kLocalHeads * kVHeadDim,
+      /*ldc=*/local_heads * kVHeadDim,
       /*strideC=*/kVHeadDim,
-      /*batchCount=*/kLocalHeads,
+      /*batchCount=*/local_heads,
       CUBLAS_COMPUTE_32F,
       CUBLAS_GEMM_DEFAULT_TENSOR_OP);
   return status == CUBLAS_STATUS_SUCCESS ? 0 : static_cast<int>(cudaErrorUnknown);

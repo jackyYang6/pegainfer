@@ -310,6 +310,9 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                                 if (has_scale) {
                                     *((float*)(token_ptr + token_dim_bound) + i) = scale_val;
                                 }
+                                if (i == 0) {
+                                    *((float*)(token_ptr + token_dim + token_scale_dim)) = route.weight;
+                                }
                             }
                         } else {
                             // Always write into the send buffer for local copies.
@@ -318,6 +321,9 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                             st_global_nc_uint4(&x_token_dst[i], val);
                             if (has_scale) {
                                 *((float*)(token_ptr + token_dim_bound) + i) = scale_val;
+                            }
+                            if (i == 0) {
+                                *((float*)(token_ptr + token_dim + token_scale_dim)) = route.weight;
                             }
                         }
                     }
@@ -364,6 +370,9 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                             if (has_scale) {
                                 *((float*)(token_ptr + token_dim_bound) + i) = scales[s];
                             }
+                            if (i == 0) {
+                                *((float*)(token_ptr + token_dim + token_scale_dim)) = route.weight;
+                            }
                         }
                     }
                 }
@@ -397,6 +406,9 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                             st_global_nc_uint4(&x_token_dst[i], vals[s]);
                             if (has_scale) {
                                 *((float*)(token_ptr + token_dim_bound) + i) = scales[s];
+                            }
+                            if (i == 0) {
+                                *((float*)(token_ptr + token_dim + token_scale_dim)) = route.weight;
                             }
                         }
                     }
@@ -454,6 +466,9 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                         st_global_nc_uint4(&x_token_dst[i], val);
                         if (has_scale) {
                             *((float*)(token_ptr + token_dim_bound) + i) = scale_val;
+                        }
+                        if (i == 0) {
+                            *((float*)(token_ptr + token_dim + token_scale_dim)) = route.weight;
                         }
                     }
                 }
@@ -513,6 +528,9 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                                 st_global_nc_uint4(&x_token_dst[i], val);
                                 if (has_scale) {
                                     *((float*)(token_ptr + token_dim_bound) + i) = scale_val;
+                                }
+                                if (i == 0) {
+                                    *((float*)(token_ptr + token_dim + token_scale_dim)) = route.weight;
                                 }
                             }
                         }

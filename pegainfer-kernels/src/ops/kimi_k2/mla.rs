@@ -90,7 +90,7 @@ fn required_cache_len(
         .ok_or_else(|| anyhow::anyhow!("Kimi MLA paged cache length overflows"))
 }
 
-fn validate_paged_layout(
+pub(super) fn validate_paged_layout(
     layout: KimiMlaPagedKvLayout,
     page_indices_d: &CudaSlice<i32>,
     page_indptr_d: &CudaSlice<i32>,
@@ -420,6 +420,7 @@ pub fn kimi_mla_absorb_q_nope(
             q_ptr as *const ffi::Half,
             out_ptr as *mut ffi::Half,
             q_nope.seq_len as i32,
+            KIMI_K2_MLA_LOCAL_HEADS_TP8 as i32,
             ctx.stream.cu_stream(),
         )
     };
@@ -450,6 +451,7 @@ pub fn kimi_mla_v_up(
             latent_ptr as *const ffi::Half,
             out_ptr as *mut ffi::Half,
             latent.seq_len as i32,
+            KIMI_K2_MLA_LOCAL_HEADS_TP8 as i32,
             ctx.stream.cu_stream(),
         )
     };

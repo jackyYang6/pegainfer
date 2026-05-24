@@ -3,57 +3,101 @@
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use pegainfer_kernels::gpu_buffers;
-use pegainfer_kernels::tensor::{DeviceContext, GpuTensor};
+use pegainfer_kernels::tensor::{DeviceContext, GpuTensor, HiddenStates};
 
 use crate::config::{
-    KIMI_K2_DENSE_INTERMEDIATE, KIMI_K2_EXPERT_INTERMEDIATE, KIMI_K2_HIDDEN, KIMI_K2_Q_LORA_RANK,
-    KIMI_K2_ROUTED_EXPERTS, KIMI_K2_TOPK,
+    KIMI_K2_EXPERT_INTERMEDIATE, KIMI_K2_HIDDEN, KIMI_K2_Q_LORA_RANK, KIMI_K2_ROUTED_EXPERTS,
+    KIMI_K2_TOPK, KimiLocalDims,
 };
 use pegainfer_kernels::ops::{
-    KIMI_K2_EP_WORLD, KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8, KIMI_K2_MLA_KV_LORA_RANK,
-    KIMI_K2_MLA_O_LOCAL_IN_TP8, KIMI_K2_MLA_Q_LOCAL_OUT_TP8, KIMI_K2_MLA_Q_NOPE_LOCAL_OUT_TP8,
-    KIMI_K2_MLA_Q_PE_LOCAL_OUT_TP8, KIMI_K2_MLA_QKV_A_OUT, KIMI_K2_MLA_ROPE_DIM,
+    KIMI_K2_EP_WORLD, KIMI_K2_MLA_KV_LORA_RANK, KIMI_K2_MLA_QKV_A_OUT, KIMI_K2_MLA_ROPE_DIM,
     KimiMarlinRouteWorkspace, KimiMarlinWna16Workspace,
 };
 
-pub(crate) const DENSE_GATE_UP_DIM: usize = KIMI_K2_DENSE_INTERMEDIATE / 4;
-pub(crate) const DENSE_ACTIVATED_DIM: usize = KIMI_K2_DENSE_INTERMEDIATE / 8;
-pub(crate) const SHARED_GATE_UP_DIM: usize = KIMI_K2_EXPERT_INTERMEDIATE / 4;
-pub(crate) const SHARED_ACTIVATED_DIM: usize = KIMI_K2_EXPERT_INTERMEDIATE / 8;
 pub(crate) const MARLIN_W13_OUT_DIM: usize = 2 * KIMI_K2_EXPERT_INTERMEDIATE;
 
-gpu_buffers! {
-    pub(crate) struct MlaDecodeScratch {
-        pub(crate) hidden:            GpuTensor<{ KIMI_K2_HIDDEN }>,
-        pub(crate) normed:            GpuTensor<{ KIMI_K2_HIDDEN }>,
-        pub(crate) projected:         GpuTensor<{ KIMI_K2_HIDDEN }>,
-        pub(crate) qkv_a:             GpuTensor<{ KIMI_K2_MLA_QKV_A_OUT }>,
-        pub(crate) q_a:               GpuTensor<{ KIMI_K2_Q_LORA_RANK }>,
-        pub(crate) q_a_normed:        GpuTensor<{ KIMI_K2_Q_LORA_RANK }>,
-        pub(crate) q_proj:            GpuTensor<{ KIMI_K2_MLA_Q_LOCAL_OUT_TP8 }>,
-        pub(crate) compressed_kv:     GpuTensor<{ KIMI_K2_MLA_KV_LORA_RANK }>,
-        pub(crate) k_rope:            GpuTensor<{ KIMI_K2_MLA_ROPE_DIM }>,
-        pub(crate) compressed_normed: GpuTensor<{ KIMI_K2_MLA_KV_LORA_RANK }>,
-        pub(crate) q_nope:            GpuTensor<{ KIMI_K2_MLA_Q_NOPE_LOCAL_OUT_TP8 }>,
-        pub(crate) q_pe:              GpuTensor<{ KIMI_K2_MLA_Q_PE_LOCAL_OUT_TP8 }>,
-        pub(crate) append_kpe:        GpuTensor<{ KIMI_K2_MLA_ROPE_DIM }>,
-        pub(crate) q_abs_nope:        GpuTensor<{ KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8 }>,
-        pub(crate) latent:            GpuTensor<{ KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8 }>,
-        pub(crate) attn_out:          GpuTensor<{ KIMI_K2_MLA_O_LOCAL_IN_TP8 }>,
+pub(crate) struct MlaDecodeScratch {
+    // TP-independent (global model dims)
+    pub(crate) hidden: GpuTensor<KIMI_K2_HIDDEN>,
+    pub(crate) normed: GpuTensor<KIMI_K2_HIDDEN>,
+    pub(crate) projected: GpuTensor<KIMI_K2_HIDDEN>,
+    pub(crate) qkv_a: GpuTensor<KIMI_K2_MLA_QKV_A_OUT>,
+    pub(crate) q_a: GpuTensor<KIMI_K2_Q_LORA_RANK>,
+    pub(crate) q_a_normed: GpuTensor<KIMI_K2_Q_LORA_RANK>,
+    pub(crate) compressed_kv: GpuTensor<KIMI_K2_MLA_KV_LORA_RANK>,
+    pub(crate) k_rope: GpuTensor<KIMI_K2_MLA_ROPE_DIM>,
+    pub(crate) compressed_normed: GpuTensor<KIMI_K2_MLA_KV_LORA_RANK>,
+    pub(crate) append_kpe: GpuTensor<KIMI_K2_MLA_ROPE_DIM>,
+
+    // TP-dependent (local_heads × per-head dim)
+    pub(crate) q_proj: HiddenStates,
+    pub(crate) q_nope: HiddenStates,
+    pub(crate) q_pe: HiddenStates,
+    pub(crate) q_abs_nope: HiddenStates,
+    pub(crate) latent: HiddenStates,
+    pub(crate) attn_out: HiddenStates,
+}
+
+impl MlaDecodeScratch {
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        batch_size: usize,
+        dims: &KimiLocalDims,
+    ) -> Result<Self> {
+        Ok(Self {
+            hidden: GpuTensor::zeros(ctx, batch_size)?,
+            normed: GpuTensor::zeros(ctx, batch_size)?,
+            projected: GpuTensor::zeros(ctx, batch_size)?,
+            qkv_a: GpuTensor::zeros(ctx, batch_size)?,
+            q_a: GpuTensor::zeros(ctx, batch_size)?,
+            q_a_normed: GpuTensor::zeros(ctx, batch_size)?,
+            compressed_kv: GpuTensor::zeros(ctx, batch_size)?,
+            k_rope: GpuTensor::zeros(ctx, batch_size)?,
+            compressed_normed: GpuTensor::zeros(ctx, batch_size)?,
+            append_kpe: GpuTensor::zeros(ctx, batch_size)?,
+            q_proj: HiddenStates::zeros(ctx, dims.q_proj_out, batch_size)?,
+            q_nope: HiddenStates::zeros(ctx, dims.q_nope_out, batch_size)?,
+            q_pe: HiddenStates::zeros(ctx, dims.q_pe_out, batch_size)?,
+            q_abs_nope: HiddenStates::zeros(ctx, dims.abs_q_out, batch_size)?,
+            latent: HiddenStates::zeros(ctx, dims.abs_q_out, batch_size)?,
+            attn_out: HiddenStates::zeros(ctx, dims.o_proj_in, batch_size)?,
+        })
     }
 }
 
-gpu_buffers! {
-    pub(crate) struct DenseMlpDecodeScratch {
-        pub(crate) gate_up:   GpuTensor<{ DENSE_GATE_UP_DIM }>,
-        pub(crate) activated: GpuTensor<{ DENSE_ACTIVATED_DIM }>,
+pub(crate) struct DenseMlpDecodeScratch {
+    pub(crate) gate_up: HiddenStates,
+    pub(crate) activated: HiddenStates,
+}
+
+impl DenseMlpDecodeScratch {
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        batch_size: usize,
+        dims: &KimiLocalDims,
+    ) -> Result<Self> {
+        Ok(Self {
+            gate_up: HiddenStates::zeros(ctx, dims.dense_gate_up, batch_size)?,
+            activated: HiddenStates::zeros(ctx, dims.dense_activated, batch_size)?,
+        })
     }
 }
 
-gpu_buffers! {
-    pub(crate) struct SharedExpertDecodeScratch {
-        pub(crate) gate_up:   GpuTensor<{ SHARED_GATE_UP_DIM }>,
-        pub(crate) activated: GpuTensor<{ SHARED_ACTIVATED_DIM }>,
+pub(crate) struct SharedExpertDecodeScratch {
+    pub(crate) gate_up: HiddenStates,
+    pub(crate) activated: HiddenStates,
+}
+
+impl SharedExpertDecodeScratch {
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        batch_size: usize,
+        dims: &KimiLocalDims,
+    ) -> Result<Self> {
+        Ok(Self {
+            gate_up: HiddenStates::zeros(ctx, dims.shared_gate_up, batch_size)?,
+            activated: HiddenStates::zeros(ctx, dims.shared_activated, batch_size)?,
+        })
     }
 }
 

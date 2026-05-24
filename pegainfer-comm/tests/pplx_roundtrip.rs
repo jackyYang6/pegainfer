@@ -37,6 +37,7 @@ fn dispatch_recv_roundtrip() {
         max_num_tokens: MAX_TOKENS,
         expert_padding: EXPERT_PADDING,
         max_private_tokens: Some(MAX_PRIVATE),
+        out_dtype: ScalarType::BF16,
         nets_per_gpu: 1,
         imm_base: 0x8b00_0000,
     };

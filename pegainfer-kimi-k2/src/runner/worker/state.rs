@@ -6,7 +6,7 @@ impl KimiRankThreadState {
         self.ctx.set_current()?;
         if self.moe_pplx_scratch.is_none() {
             self.moe_pplx_scratch = Some(
-                crate::runner::moe_pplx::KimiMoePplxScratch::new(
+                crate::runner::moe_pplx::KimiMoePplxScratch::new_decode(
                     &self.ctx.as_device_context(),
                     KIMI_DECODE_MAX_BATCH,
                 )
@@ -73,14 +73,17 @@ impl KimiRankThreadState {
                         self.sliced_load_plan.rank
                     )
                 })?;
-        let decode_arenas =
-            KimiWorkerDecodeArenas::new(&self.ctx.as_device_context(), one_token_cache.vocab_rows)
-                .with_context(|| {
-                    format!(
-                        "failed to allocate Kimi rank {} decode arenas",
-                        self.sliced_load_plan.rank
-                    )
-                })?;
+        let decode_arenas = KimiWorkerDecodeArenas::new(
+            &self.ctx.as_device_context(),
+            one_token_cache.vocab_rows,
+            &self.local_dims,
+        )
+        .with_context(|| {
+            format!(
+                "failed to allocate Kimi rank {} decode arenas",
+                self.sliced_load_plan.rank
+            )
+        })?;
         let report = KimiRankWeightLoadReport::from_loaded_weights(
             tensor_count,
             total_bytes,
@@ -114,8 +117,9 @@ impl KimiRankThreadState {
         slot: usize,
         decode_batch_size: usize,
         input_ids: &[u32],
+        ep_max_seq_len: usize,
     ) -> Result<KimiOneTokenForwardReport> {
-        self.forward_prompt_next_token_inner(slot, decode_batch_size, input_ids)
+        self.forward_prompt_next_token_inner(slot, decode_batch_size, input_ids, ep_max_seq_len)
     }
 
     pub(super) fn forward_decode_batch_next_tokens(
@@ -137,12 +141,7 @@ impl KimiRankThreadState {
         let loaded = self.loaded.as_mut().ok_or_else(|| {
             anyhow::anyhow!("Kimi rank weights must be loaded before batch decode")
         })?;
-        let tp_comm = self.tp_comm.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Kimi rank {} TP comm must be attached before batch decode",
-                loaded.gpu.rank
-            )
-        })?;
+        let tp_comm_ref = self.tp_comm.as_ref().map(|c| c.get());
         let device_ctx = self.ctx.as_device_context();
         let decode_aux_ctx = DeviceContext {
             ctx: Arc::clone(&self.decode_aux_ctx.ctx),
@@ -187,6 +186,7 @@ impl KimiRankThreadState {
             .upload_batch_tokens(&device_ctx, token_ids)
             .with_context(|| format!("Kimi rank {rank} upload batch decode tokens"))?;
 
+        let local_heads = self.local_dims.local_heads;
         if self.enable_cuda_graph {
             let mut graph = std::mem::take(&mut decode_arena.graph);
             let graph_barrier = Arc::clone(&self.collective_barrier);
@@ -199,10 +199,11 @@ impl KimiRankThreadState {
                     forward_decode_batch_next_token_kernels(
                         &device_ctx,
                         &decode_aux_ctx,
-                        tp_comm.get(),
+                        tp_comm_ref,
                         cache,
                         expert_kernels,
                         decode_arena,
+                        local_heads,
                         #[cfg(feature = "pplx-ep")]
                         None,
                     )
@@ -220,10 +221,11 @@ impl KimiRankThreadState {
             forward_decode_batch_next_token_kernels(
                 &device_ctx,
                 &decode_aux_ctx,
-                tp_comm.get(),
+                tp_comm_ref,
                 cache,
                 expert_kernels,
                 decode_arena,
+                local_heads,
                 #[cfg(feature = "pplx-ep")]
                 pplx_ctx.as_mut(),
             )?;
@@ -259,19 +261,17 @@ impl KimiRankThreadState {
         slot: usize,
         decode_batch_size: usize,
         input_ids: &[u32],
+        ep_max_seq_len: usize,
     ) -> Result<KimiOneTokenForwardReport> {
+        #[cfg(not(feature = "pplx-ep"))]
+        let _ = ep_max_seq_len;
         ensure!(!input_ids.is_empty(), "Kimi prompt forward requires tokens");
         self.ctx.set_current()?;
         let loaded = self
             .loaded
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Kimi rank weights must be loaded before forward"))?;
-        let tp_comm = self.tp_comm.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Kimi rank {} TP comm must be attached before forward",
-                loaded.gpu.rank
-            )
-        })?;
+        let tp_comm_ref = self.tp_comm.as_ref().map(|c| c.get());
         let device_ctx = self.ctx.as_device_context();
         let KimiRankLoadedWeights {
             gpu,
@@ -301,15 +301,15 @@ impl KimiRankThreadState {
             cache.vocab_start as u32,
         )?;
         self.collective_barrier.wait();
-        device_ctx
-            .sync()
-            .with_context(|| format!("Kimi rank {} sync before first TP all-reduce", rank))?;
-        tp_comm
-            .get()
-            .all_reduce_in_place(&mut hidden.data, &ReduceOp::Sum)
-            .map_err(|err| {
-                anyhow::anyhow!("Kimi TP all-reduce bf16 hidden failed: status={:?}", err.0)
-            })?;
+        if let Some(comm) = tp_comm_ref {
+            device_ctx
+                .sync()
+                .with_context(|| format!("Kimi rank {} sync before first TP all-reduce", rank))?;
+            comm.all_reduce_in_place(&mut hidden.data, &ReduceOp::Sum)
+                .map_err(|err| {
+                    anyhow::anyhow!("Kimi TP all-reduce bf16 hidden failed: status={:?}", err.0)
+                })?;
+        }
 
         let (cos_host, sin_host) = build_yarn_rope_cache(seq_len);
         let cos = device_ctx.stream.clone_htod(&cos_host)?;
@@ -317,12 +317,35 @@ impl KimiRankThreadState {
         let mut normed = GpuTensor::<KIMI_K2_HIDDEN>::zeros(&device_ctx, seq_len)?;
         let mut next_hidden = GpuTensor::<KIMI_K2_HIDDEN>::zeros(&device_ctx, seq_len)?;
 
+        #[cfg(feature = "pplx-ep")]
+        let decode_aux_ctx = DeviceContext {
+            ctx: Arc::clone(&self.decode_aux_ctx.ctx),
+            stream: Arc::clone(&self.decode_aux_ctx.stream),
+            device_ordinal: self.decode_aux_ctx.device_ordinal,
+        };
+        #[cfg(feature = "pplx-ep")]
+        let mut pplx_prefill_scratch = if tp_comm_ref.is_none() && ep_max_seq_len > 0 {
+            Some(
+                crate::runner::moe_pplx::KimiMoePplxScratch::new_prefill(
+                    &device_ctx,
+                    ep_max_seq_len,
+                )
+                .with_context(|| {
+                    format!(
+                        "Kimi rank {rank} PPLX prefill scratch (ep_max_seq_len={ep_max_seq_len})"
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
+
         let mut dense_layers_executed = 0usize;
         let mut moe_layers_executed = 0usize;
         for layer in &cache.layers {
             Self::forward_mla_prefill(
                 &device_ctx,
-                tp_comm.get(),
+                tp_comm_ref,
                 layer.layer_idx,
                 &layer.attention,
                 &cos,
@@ -331,13 +354,14 @@ impl KimiRankThreadState {
                 &mut hidden,
                 &mut normed,
                 &mut next_hidden,
+                self.local_dims.local_heads,
             )
             .with_context(|| format!("Kimi MLA prefill layer {}", layer.layer_idx))?;
             match &layer.kind {
                 KimiLayerForwardKindCache::Dense(dense) => {
                     Self::forward_dense_mlp(
                         &device_ctx,
-                        tp_comm.get(),
+                        tp_comm_ref,
                         dense,
                         &layer.attention.post_attention_norm,
                         &mut hidden,
@@ -348,18 +372,53 @@ impl KimiRankThreadState {
                     dense_layers_executed += 1;
                 }
                 KimiLayerForwardKindCache::Moe(moe) => {
-                    Self::forward_moe_layer(
-                        &device_ctx,
-                        tp_comm.get(),
-                        layer.layer_idx,
-                        moe,
-                        &layer.attention.post_attention_norm,
-                        expert_kernels,
-                        &mut hidden,
-                        &mut normed,
-                        &mut next_hidden,
-                    )
-                    .with_context(|| format!("Kimi MoE layer {}", layer.layer_idx))?;
+                    #[cfg(feature = "pplx-ep")]
+                    if let Some(pplx_scratch) = pplx_prefill_scratch.as_mut() {
+                        crate::runner::moe_pplx::forward_moe_layer_prefill_pplx(
+                            &device_ctx,
+                            &decode_aux_ctx,
+                            self.ep_backend.as_mut().expect("TP1 requires PPLX"),
+                            layer.layer_idx,
+                            moe,
+                            &layer.attention.post_attention_norm,
+                            expert_kernels,
+                            &mut hidden,
+                            &mut normed,
+                            &mut next_hidden,
+                            pplx_scratch,
+                        )
+                        .with_context(|| {
+                            format!("Kimi MoE PPLX prefill layer {}", layer.layer_idx)
+                        })?;
+                    } else {
+                        Self::forward_moe_layer(
+                            &device_ctx,
+                            tp_comm_ref,
+                            layer.layer_idx,
+                            moe,
+                            &layer.attention.post_attention_norm,
+                            expert_kernels,
+                            &mut hidden,
+                            &mut normed,
+                            &mut next_hidden,
+                        )
+                        .with_context(|| format!("Kimi MoE layer {}", layer.layer_idx))?;
+                    }
+                    #[cfg(not(feature = "pplx-ep"))]
+                    {
+                        Self::forward_moe_layer(
+                            &device_ctx,
+                            tp_comm_ref,
+                            layer.layer_idx,
+                            moe,
+                            &layer.attention.post_attention_norm,
+                            expert_kernels,
+                            &mut hidden,
+                            &mut normed,
+                            &mut next_hidden,
+                        )
+                        .with_context(|| format!("Kimi MoE layer {}", layer.layer_idx))?;
+                    }
                     moe_layers_executed += 1;
                 }
             }
@@ -388,7 +447,7 @@ impl KimiRankThreadState {
         };
         let (local_next, local_top_logit_f32) = sample_local_top1_with_value(&device_ctx, &logits)?;
 
-        Ok(KimiOneTokenForwardReport {
+        let report = KimiOneTokenForwardReport {
             rank,
             batch_slot: slot,
             input_token_id,
@@ -399,12 +458,13 @@ impl KimiRankThreadState {
             vocab_rows: cache.vocab_rows,
             dense_layers_executed,
             moe_layers_executed,
-        })
+        };
+        Ok(report)
     }
 
     fn forward_mla_prefill(
         ctx: &DeviceContext,
-        comm: &Comm,
+        comm: Option<&Comm>,
         layer_idx: usize,
         attention: &KimiAttentionForwardCache,
         cos: &CudaSlice<half::bf16>,
@@ -413,38 +473,55 @@ impl KimiRankThreadState {
         hidden: &mut GpuTensor<KIMI_K2_HIDDEN>,
         normed: &mut GpuTensor<KIMI_K2_HIDDEN>,
         next_hidden: &mut GpuTensor<KIMI_K2_HIDDEN>,
+        local_heads: usize,
     ) -> Result<()> {
         let seq_len = hidden.seq_len;
+        let q_proj_out = local_heads * KIMI_K2_MLA_Q_HEAD_DIM;
+        let kv_b_out = attention.kv_b_proj.rows;
         pegainfer_kernels::typed_pipeline! {
             ctx = ctx, eps = KIMI_K2_RMS_NORM_EPS, seq_len = seq_len, gemm = prefill;
             tensor qkv_a: KIMI_K2_MLA_QKV_A_OUT;
             tensor q_a: KIMI_K2_Q_LORA_RANK;
             tensor q_a_normed: KIMI_K2_Q_LORA_RANK;
-            tensor q_proj: KIMI_K2_MLA_Q_LOCAL_OUT_TP8;
             tensor compressed_kv: KIMI_K2_MLA_KV_LORA_RANK;
             tensor k_rope: KIMI_K2_MLA_ROPE_DIM;
             tensor compressed_normed: KIMI_K2_MLA_KV_LORA_RANK;
-            tensor kv_b: KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8;
             tensor append_kpe: KIMI_K2_MLA_ROPE_DIM;
-            tensor q_attn: KIMI_K2_MLA_Q_LOCAL_OUT_TP8;
 
             rms_norm(hidden => normed, attention.input_norm);
             gemm(normed => &mut qkv_a, attention.fused_qkv_a_proj);
             try kimi_mla_split_qkv_a(ctx, &qkv_a, &mut q_a, &mut compressed_kv, &mut k_rope);
             rms_norm(&q_a => &mut q_a_normed, attention.q_a_norm);
-            gemm(&q_a_normed => &mut q_proj, attention.q_b_proj);
-            rms_norm(&compressed_kv => &mut compressed_normed, attention.kv_a_norm);
-            try kimi_mla_rope_apply_kpe(ctx, &k_rope, cos, sin, &decode_arena.positions_d, &mut append_kpe);
-            try decode_arena.append_prefill_layer_kv(ctx, layer_idx, &compressed_normed, &append_kpe);
-            gemm(&compressed_normed => &mut kv_b, attention.kv_b_proj);
         }
+        let mut q_proj = HiddenStates::zeros(ctx, q_proj_out, seq_len)?;
+        typed_ops::gemm_dm_typed_to_hs(ctx, &attention.q_b_proj, &q_a_normed, &mut q_proj)?;
+        typed_ops::rms_norm_into(
+            ctx,
+            &compressed_kv,
+            &attention.kv_a_norm,
+            KIMI_K2_RMS_NORM_EPS,
+            &mut compressed_normed,
+        )?;
+        kimi_mla_rope_apply_kpe(
+            ctx,
+            &k_rope,
+            cos,
+            sin,
+            &decode_arena.positions_d,
+            &mut append_kpe,
+        )?;
+        decode_arena.append_prefill_layer_kv(ctx, layer_idx, &compressed_normed, &append_kpe)?;
+        let mut kv_b = HiddenStates::zeros(ctx, kv_b_out, seq_len)?;
+        typed_ops::gemm_dm_typed_to_hs(ctx, &attention.kv_b_proj, &compressed_normed, &mut kv_b)?;
+
         let mut k_cache = ctx
             .stream
-            .alloc_zeros(seq_len * KIMI_K2_MLA_LOCAL_HEADS_TP8 * KIMI_K2_MLA_Q_HEAD_DIM)?;
+            .alloc_zeros(seq_len * local_heads * KIMI_K2_MLA_Q_HEAD_DIM)?;
         let mut v_cache = ctx
             .stream
-            .alloc_zeros(seq_len * KIMI_K2_MLA_LOCAL_HEADS_TP8 * KIMI_K2_MLA_V_HEAD_DIM)?;
-        kimi_mla_rope_assemble_prefill(
+            .alloc_zeros(seq_len * local_heads * KIMI_K2_MLA_V_HEAD_DIM)?;
+        let mut q_attn = HiddenStates::zeros(ctx, q_proj_out, seq_len)?;
+        kimi_mla_rope_assemble_prefill_rt(
             ctx,
             &q_proj,
             &k_rope,
@@ -454,31 +531,36 @@ impl KimiRankThreadState {
             &mut q_attn,
             &mut k_cache,
             &mut v_cache,
+            local_heads,
         )?;
 
-        pegainfer_kernels::typed_pipeline! {
-            ctx = ctx, eps = KIMI_K2_RMS_NORM_EPS, seq_len = seq_len, gemm = prefill;
-            tensor attn_out: KIMI_K2_MLA_O_LOCAL_IN_TP8;
-            tensor projected: KIMI_K2_HIDDEN;
-
-            try kimi_flashinfer_single_prefill_mla(ctx, &q_attn, &k_cache, &v_cache, &mut attn_out, kimi_mla_softmax_scale());
-            gemm(&attn_out => &mut projected, attention.o_proj);
+        let o_proj_in = local_heads * KIMI_K2_MLA_V_HEAD_DIM;
+        let mut attn_out = HiddenStates::zeros(ctx, o_proj_in, seq_len)?;
+        kimi_flashinfer_single_prefill_mla_rt(
+            ctx,
+            &q_attn,
+            &k_cache,
+            &v_cache,
+            &mut attn_out,
+            kimi_mla_softmax_scale(),
+            local_heads,
+        )?;
+        let mut projected = GpuTensor::<KIMI_K2_HIDDEN>::zeros(ctx, seq_len)?;
+        typed_ops::gemm_dm_hs_to_typed(ctx, &attention.o_proj, &attn_out, &mut projected)?;
+        if let Some(comm) = comm {
+            comm.all_reduce_in_place(&mut projected.data, &ReduceOp::Sum)
+                .map_err(|err| {
+                    anyhow::anyhow!("Kimi TP all-reduce bf16 hidden failed: status={:?}", err.0)
+                })?;
         }
-        comm.all_reduce_in_place(&mut projected.data, &ReduceOp::Sum)
-            .map_err(|err| {
-                anyhow::anyhow!("Kimi TP all-reduce bf16 hidden failed: status={:?}", err.0)
-            })?;
-        pegainfer_kernels::typed_pipeline! {
-            ctx = ctx, eps = KIMI_K2_RMS_NORM_EPS;
-            add(hidden, &projected => next_hidden);
-            swap(hidden, next_hidden);
-        }
+        typed_ops::add_into(ctx, hidden, &projected, next_hidden)?;
+        std::mem::swap(hidden, next_hidden);
         Ok(())
     }
 
     fn forward_dense_mlp(
         ctx: &DeviceContext,
-        comm: &Comm,
+        comm: Option<&Comm>,
         dense: &KimiDenseForwardCache,
         post_attention_norm: &NormWeight<KIMI_K2_HIDDEN>,
         hidden: &mut GpuTensor<KIMI_K2_HIDDEN>,
@@ -498,7 +580,7 @@ impl KimiRankThreadState {
 
     fn forward_moe_layer(
         ctx: &DeviceContext,
-        comm: &Comm,
+        comm: Option<&Comm>,
         layer_idx: usize,
         moe: &KimiMoeForwardCache,
         post_attention_norm: &NormWeight<KIMI_K2_HIDDEN>,

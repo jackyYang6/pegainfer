@@ -59,6 +59,7 @@ void a2a_dispatch_recv_kernel(
         uint4 *x_token_src;
         uint4 *x_token_dst;
         float *x_scale_src;
+        float *route_weight_src;
         float *x_scale_dst;
     };
     constexpr size_t NUM_STAGES = 8;
@@ -73,6 +74,7 @@ void a2a_dispatch_recv_kernel(
             uint32_t dst_index = shared_stage[i].dst_index;
             local_stage[i].x_token_src = (uint4*)(recv_buffer + src_index * token_stride);
             local_stage[i].x_scale_src = (float*)(recv_buffer + src_index * token_stride + token_dim_bound);
+            local_stage[i].route_weight_src = (float*)(recv_buffer + src_index * token_stride + token_dim + token_scale_dim);
             local_stage[i].x_token_dst = (uint4*)(out_x_ptr + dst_index * out_x_stride);
             local_stage[i].x_scale_dst = (float*)(out_x_scale_ptr + dst_index * out_x_scale_stride_token);
         }
@@ -138,6 +140,7 @@ void a2a_dispatch_recv_kernel(
         // Token originates from the local node - copy it from an NVLink buffer.
         uint4 *x_token_dst = (uint4*)(out_x_ptr + padded_token * out_x_stride);
         float *x_scale_src = (float*)((std::byte*)x_token_src + token_dim);
+        float *route_weight_src = (float*)((std::byte*)x_token_src + token_dim + token_scale_dim);
         float *x_scale_dst = (float*)(out_x_scale_ptr + padded_token * out_x_scale_stride_token);
         for (unsigned i = threadIdx.x; i * sizeof(uint4) < token_dim; i += blockDim.x) {
             const bool has_scale = out_x_scale_ptr && i < hidden_dim_scale_bound;
@@ -152,6 +155,9 @@ void a2a_dispatch_recv_kernel(
             if (has_scale) {
                 x_scale_dst[i * out_x_scale_stride_elem] = scale;
             }
+        }
+        if (threadIdx.x == 0 && out_x_scale_ptr != nullptr && hidden_dim_scale == 0) {
+            x_scale_dst[0] = route_weight_src[0];
         }
     }
 
@@ -196,6 +202,7 @@ void a2a_dispatch_recv_kernel(
             uint4 *x_token_dst = local_stage[s].x_token_dst;
             float *x_scale_dst = local_stage[s].x_scale_dst;
             float *x_scale_src = local_stage[s].x_scale_src;
+            float *route_weight_src = local_stage[s].route_weight_src;
 
             for (unsigned i = threadIdx.x; i * sizeof(uint4) < token_dim_bound; i += blockDim.x) {
                 const bool has_scale = out_x_scale_ptr && i < hidden_dim_scale_bound;
@@ -208,6 +215,9 @@ void a2a_dispatch_recv_kernel(
                 if (has_scale) {
                     x_scale_dst[i * out_x_scale_stride_elem] = scale;
                 }
+            }
+            if (threadIdx.x == 0 && out_x_scale_ptr != nullptr && hidden_dim_scale == 0) {
+                x_scale_dst[0] = route_weight_src[0];
             }
 
             token += gridDim.x;

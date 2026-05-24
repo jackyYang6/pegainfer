@@ -164,7 +164,6 @@ impl KimiRankGpuWeights {
         );
         ctx.set_current()?;
         let mut layers = Vec::with_capacity(KIMI_K2_MOE_LAYERS);
-        let mut packaged_moes = Vec::with_capacity(KIMI_K2_MOE_LAYERS);
         for layer in &names.layers {
             let KimiLayerWeightKindNames::Moe(moe) = &layer.kind else {
                 continue;
@@ -221,7 +220,7 @@ impl KimiRankGpuWeights {
             };
             weights.as_marlin_weights().validate()?;
             layers.push(weights);
-            packaged_moes.push(moe);
+            self.remove_packaged_routed_expert_raw_tensors(&[moe])?;
         }
         ensure!(
             layers.len() == KIMI_K2_MOE_LAYERS,
@@ -231,7 +230,6 @@ impl KimiRankGpuWeights {
         );
         let raw_source_bytes = layers.iter().map(|layer| layer.raw_source_bytes).sum();
         let total_bytes = layers.iter().map(|layer| layer.total_bytes).sum();
-        self.remove_packaged_routed_expert_raw_tensors(&packaged_moes)?;
         Ok(KimiRankExpertMarlinWeights {
             rank: self.rank,
             local_expert_range: names.plan.local_expert_range.clone(),

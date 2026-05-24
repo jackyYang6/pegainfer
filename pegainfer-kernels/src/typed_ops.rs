@@ -7,7 +7,7 @@ use anyhow::Result;
 use cudarc::driver::{DevicePtr, DevicePtrMut};
 
 use crate::ffi;
-use crate::tensor::{DeviceContext, GpuTensor, GpuWeight, HiddenStates, NormWeight};
+use crate::tensor::{DeviceContext, DeviceMatrix, GpuTensor, GpuWeight, HiddenStates, NormWeight};
 
 // ── GEMM ─────────────────────────────────────────────────────────────
 
@@ -306,6 +306,167 @@ pub fn f32_to_bf16_into<const DIM: usize>(
         )
     };
     result.result()?;
+    Ok(())
+}
+
+// ── Runtime-dim GEMM ─────────────────────────────────────────────────
+
+/// `Y = W @ X` — DeviceMatrix weight, typed input, runtime-dim output (graph-safe).
+pub fn gemm_dm_typed_to_hs_graphsafe<const IN: usize>(
+    ctx: &DeviceContext,
+    w: &DeviceMatrix,
+    x: &GpuTensor<IN>,
+    y: &mut HiddenStates,
+) -> Result<()> {
+    anyhow::ensure!(
+        w.cols == IN,
+        "DM→HS GEMM weight cols={} must match input dim {}",
+        w.cols,
+        IN
+    );
+    anyhow::ensure!(
+        y.hidden_dim == w.rows && y.seq_len == x.seq_len,
+        "DM→HS GEMM shape mismatch: w.rows={}, y.hidden={}, x.seq={}, y.seq={}",
+        w.rows,
+        y.hidden_dim,
+        x.seq_len,
+        y.seq_len
+    );
+    let (w_ptr, _gw) = w.data.device_ptr(&ctx.stream);
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (y_ptr, _gy) = y.data.device_ptr_mut(&ctx.stream);
+    launch_gemm(
+        w_ptr as *const ffi::Half,
+        x_ptr as *const ffi::Half,
+        y_ptr as *mut ffi::Half,
+        w.rows,
+        x.seq_len,
+        IN,
+        true,
+        ctx,
+    )
+}
+
+/// `Y = W @ X` — DeviceMatrix weight, runtime-dim input, typed output (graph-safe).
+pub fn gemm_dm_hs_to_typed_graphsafe<const OUT: usize>(
+    ctx: &DeviceContext,
+    w: &DeviceMatrix,
+    x: &HiddenStates,
+    y: &mut GpuTensor<OUT>,
+) -> Result<()> {
+    anyhow::ensure!(
+        w.rows == OUT && w.cols == x.hidden_dim,
+        "HS→typed GEMM shape mismatch: w=[{},{}], expected=[{},{}]",
+        w.rows,
+        w.cols,
+        OUT,
+        x.hidden_dim
+    );
+    anyhow::ensure!(
+        y.seq_len == x.seq_len,
+        "HS→typed GEMM seq_len mismatch: input={}, output={}",
+        x.seq_len,
+        y.seq_len
+    );
+    let (w_ptr, _gw) = w.data.device_ptr(&ctx.stream);
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (y_ptr, _gy) = y.data.device_ptr_mut(&ctx.stream);
+    launch_gemm(
+        w_ptr as *const ffi::Half,
+        x_ptr as *const ffi::Half,
+        y_ptr as *mut ffi::Half,
+        OUT,
+        x.seq_len,
+        x.hidden_dim,
+        true,
+        ctx,
+    )
+}
+
+/// `Y = W @ X` — DeviceMatrix weight, typed input, runtime-dim output (prefill cuBLAS).
+pub fn gemm_dm_typed_to_hs<const IN: usize>(
+    ctx: &DeviceContext,
+    w: &DeviceMatrix,
+    x: &GpuTensor<IN>,
+    y: &mut HiddenStates,
+) -> Result<()> {
+    anyhow::ensure!(
+        w.cols == IN && y.hidden_dim == w.rows && y.seq_len == x.seq_len,
+        "DM→HS prefill GEMM shape mismatch"
+    );
+    let (w_ptr, _gw) = w.data.device_ptr(&ctx.stream);
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (y_ptr, _gy) = y.data.device_ptr_mut(&ctx.stream);
+    launch_gemm(
+        w_ptr as *const ffi::Half,
+        x_ptr as *const ffi::Half,
+        y_ptr as *mut ffi::Half,
+        w.rows,
+        x.seq_len,
+        IN,
+        x.seq_len == 1,
+        ctx,
+    )
+}
+
+/// `Y = W @ X` — DeviceMatrix weight, runtime-dim input, typed output (prefill cuBLAS).
+pub fn gemm_dm_hs_to_typed<const OUT: usize>(
+    ctx: &DeviceContext,
+    w: &DeviceMatrix,
+    x: &HiddenStates,
+    y: &mut GpuTensor<OUT>,
+) -> Result<()> {
+    anyhow::ensure!(
+        w.rows == OUT && w.cols == x.hidden_dim && y.seq_len == x.seq_len,
+        "HS→typed prefill GEMM shape mismatch"
+    );
+    let (w_ptr, _gw) = w.data.device_ptr(&ctx.stream);
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (y_ptr, _gy) = y.data.device_ptr_mut(&ctx.stream);
+    launch_gemm(
+        w_ptr as *const ffi::Half,
+        x_ptr as *const ffi::Half,
+        y_ptr as *mut ffi::Half,
+        OUT,
+        x.seq_len,
+        x.hidden_dim,
+        x.seq_len == 1,
+        ctx,
+    )
+}
+
+// ── Runtime-dim SiLU-mul ────────────────────────────────────────────
+
+/// Fused SiLU-mul: `gate_up:[2*INTER, bs]` → `out:[INTER, bs]`, runtime INTER.
+pub fn silu_mul_hs_fused_into(
+    ctx: &DeviceContext,
+    gate_up: &HiddenStates,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    let inter = out.hidden_dim;
+    anyhow::ensure!(
+        gate_up.hidden_dim == 2 * inter,
+        "silu_mul_hs gate_up.hidden={} must be 2 * out.hidden={}",
+        gate_up.hidden_dim,
+        inter
+    );
+    anyhow::ensure!(
+        gate_up.seq_len == out.seq_len,
+        "silu_mul_hs seq_len mismatch: gate_up={}, out={}",
+        gate_up.seq_len,
+        out.seq_len
+    );
+    let (gu_ptr, _g0) = gate_up.data.device_ptr(&ctx.stream);
+    let (o_ptr, _g1) = out.data.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::silu_mul_fused_cuda(
+            gu_ptr as *const ffi::Half,
+            o_ptr as *mut ffi::Half,
+            inter as i32,
+            gate_up.seq_len as i32,
+            ctx.stream.cu_stream(),
+        );
+    }
     Ok(())
 }
 

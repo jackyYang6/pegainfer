@@ -3,10 +3,11 @@ use super::{runtime::*, *};
 pub(super) fn forward_decode_batch_next_token_kernels(
     device_ctx: &DeviceContext,
     decode_aux_ctx: &DeviceContext,
-    comm: &Comm,
+    comm: Option<&Comm>,
     cache: &KimiOneTokenForwardCache,
     expert_kernels: &KimiRankExpertMarlinWeights,
     decode_arena: &mut KimiWorkerDecodeArena,
+    local_heads: usize,
     #[cfg(feature = "pplx-ep")] mut pplx: Option<&mut PplxDecodeContext<'_>>,
 ) -> Result<()> {
     typed_ops::embedding_vocab_shard_into(
@@ -16,7 +17,7 @@ pub(super) fn forward_decode_batch_next_token_kernels(
         &mut decode_arena.scratch.mla.hidden,
         cache.vocab_start as u32,
     )?;
-    all_reduce_hidden_via_f32_in_place(
+    maybe_all_reduce_hidden_via_f32_in_place(
         device_ctx,
         &mut decode_arena.scratch.mla.hidden,
         &mut decode_arena.scratch.comm.hidden_allreduce_f32,
@@ -24,9 +25,15 @@ pub(super) fn forward_decode_batch_next_token_kernels(
     )?;
 
     for layer in &cache.layers {
-        forward_mla_decode_layer_into(device_ctx, &layer.attention, decode_arena, layer.layer_idx)
-            .with_context(|| format!("Kimi MLA batch decode layer {}", layer.layer_idx))?;
-        all_reduce_hidden_via_f32_in_place(
+        forward_mla_decode_layer_into(
+            device_ctx,
+            &layer.attention,
+            decode_arena,
+            layer.layer_idx,
+            local_heads,
+        )
+        .with_context(|| format!("Kimi MLA batch decode layer {}", layer.layer_idx))?;
+        maybe_all_reduce_hidden_via_f32_in_place(
             device_ctx,
             &mut decode_arena.scratch.mla.projected,
             &mut decode_arena.scratch.comm.hidden_allreduce_f32,
@@ -132,6 +139,7 @@ pub(super) fn forward_mla_decode_layer_into(
     attention: &KimiAttentionForwardCache,
     arena: &mut KimiWorkerDecodeArena,
     layer_idx: usize,
+    local_heads: usize,
 ) -> Result<()> {
     let KimiWorkerDecodeArena {
         layout,
@@ -180,7 +188,7 @@ pub(super) fn forward_mla_decode_layer_into(
         KIMI_K2_RMS_NORM_EPS,
         &mut scratch.mla.q_a_normed,
     )?;
-    typed_ops::gemm_graphsafe_into(
+    typed_ops::gemm_dm_typed_to_hs_graphsafe(
         ctx,
         &attention.q_b_proj,
         &scratch.mla.q_a_normed,
@@ -193,7 +201,7 @@ pub(super) fn forward_mla_decode_layer_into(
         KIMI_K2_RMS_NORM_EPS,
         &mut scratch.mla.compressed_normed,
     )?;
-    kimi_mla_rope_split_decode(
+    kimi_mla_rope_split_decode_rt(
         ctx,
         &scratch.mla.q_proj,
         &scratch.mla.k_rope,
@@ -203,12 +211,14 @@ pub(super) fn forward_mla_decode_layer_into(
         &mut scratch.mla.q_nope,
         &mut scratch.mla.q_pe,
         &mut scratch.mla.append_kpe,
+        local_heads,
     )?;
-    kimi_mla_absorb_q_nope(
+    kimi_mla_absorb_q_nope_rt(
         ctx,
         &attention.kv_b_proj,
         &scratch.mla.q_nope,
         &mut scratch.mla.q_abs_nope,
+        local_heads,
     )?;
     kimi_mla_paged_kv_append(
         ctx,
@@ -223,7 +233,7 @@ pub(super) fn forward_mla_decode_layer_into(
         batch_indices_d,
         positions_d,
     )?;
-    kimi_flashinfer_batch_decode_mla(
+    kimi_flashinfer_batch_decode_mla_rt(
         ctx,
         &scratch.mla.q_abs_nope,
         &scratch.mla.q_pe,
@@ -238,14 +248,16 @@ pub(super) fn forward_mla_decode_layer_into(
         kv_tile_indices_d,
         kv_chunk_size_d,
         kimi_mla_softmax_scale(),
+        local_heads,
     )?;
-    kimi_mla_v_up(
+    kimi_mla_v_up_rt(
         ctx,
         &attention.kv_b_proj,
         &scratch.mla.latent,
         &mut scratch.mla.attn_out,
+        local_heads,
     )?;
-    typed_ops::gemm_graphsafe_into(
+    typed_ops::gemm_dm_hs_to_typed_graphsafe(
         ctx,
         &attention.o_proj,
         &scratch.mla.attn_out,
@@ -256,7 +268,7 @@ pub(super) fn forward_mla_decode_layer_into(
 
 pub(super) fn forward_dense_mlp_batch_into(
     ctx: &DeviceContext,
-    comm: &Comm,
+    comm: Option<&Comm>,
     dense: &KimiDenseForwardCache,
     post_attention_norm: &NormWeight<KIMI_K2_HIDDEN>,
     hidden: &mut GpuTensor<KIMI_K2_HIDDEN>,
@@ -264,44 +276,62 @@ pub(super) fn forward_dense_mlp_batch_into(
     next_hidden: &mut GpuTensor<KIMI_K2_HIDDEN>,
 ) -> Result<()> {
     let seq_len = hidden.seq_len;
-    pegainfer_kernels::typed_pipeline! {
-        ctx = ctx, eps = KIMI_K2_RMS_NORM_EPS, seq_len = seq_len, gemm = prefill;
-        tensor gate_up: DENSE_GATE_UP_DIM;
-        tensor activated: DENSE_ACTIVATED_DIM;
-        tensor mlp_out: KIMI_K2_HIDDEN;
-
-        rms_norm(hidden => normed, post_attention_norm);
-        gemm(normed => &mut gate_up, dense.gate_up_proj);
-        silu_mul<DENSE_ACTIVATED_DIM>(&gate_up => &mut activated);
-        gemm(&activated => &mut mlp_out, dense.down_proj);
+    typed_ops::rms_norm_into(
+        ctx,
+        hidden,
+        post_attention_norm,
+        KIMI_K2_RMS_NORM_EPS,
+        normed,
+    )?;
+    let mut gate_up = HiddenStates::zeros(ctx, dense.gate_up_proj.rows, seq_len)?;
+    typed_ops::gemm_dm_typed_to_hs(ctx, &dense.gate_up_proj, normed, &mut gate_up)?;
+    let mut activated = HiddenStates::zeros(ctx, dense.down_proj.cols, seq_len)?;
+    typed_ops::silu_mul_hs_fused_into(ctx, &gate_up, &mut activated)?;
+    let mut mlp_out = GpuTensor::<KIMI_K2_HIDDEN>::zeros(ctx, seq_len)?;
+    typed_ops::gemm_dm_hs_to_typed(ctx, &dense.down_proj, &activated, &mut mlp_out)?;
+    if let Some(comm) = comm {
+        comm.all_reduce_in_place(&mut mlp_out.data, &ReduceOp::Sum)
+            .map_err(|err| {
+                anyhow::anyhow!("Kimi TP all-reduce bf16 hidden failed: status={:?}", err.0)
+            })?;
     }
-    comm.all_reduce_in_place(&mut mlp_out.data, &ReduceOp::Sum)
-        .map_err(|err| {
-            anyhow::anyhow!("Kimi TP all-reduce bf16 hidden failed: status={:?}", err.0)
-        })?;
-    pegainfer_kernels::typed_pipeline! {
-        ctx = ctx, eps = KIMI_K2_RMS_NORM_EPS;
-        add(hidden, &mlp_out => next_hidden);
-        swap(hidden, next_hidden);
-    }
+    typed_ops::add_into(ctx, hidden, &mlp_out, next_hidden)?;
+    std::mem::swap(hidden, next_hidden);
     Ok(())
 }
 
 pub(super) fn forward_dense_mlp_decode_into(
     ctx: &DeviceContext,
-    comm: &Comm,
+    comm: Option<&Comm>,
     dense: &KimiDenseForwardCache,
     post_attention_norm: &NormWeight<KIMI_K2_HIDDEN>,
     scratch: &mut KimiWorkerDecodeScratch,
 ) -> Result<()> {
-    pegainfer_kernels::typed_pipeline! {
-        ctx = ctx, eps = KIMI_K2_RMS_NORM_EPS;
-        rms_norm (&scratch.mla.hidden           => &mut scratch.mla.normed,         post_attention_norm);
-        gemm     (&scratch.mla.normed           => &mut scratch.dense_mlp.gate_up,  dense.gate_up_proj);
-        silu_mul<DENSE_ACTIVATED_DIM> (&scratch.dense_mlp.gate_up => &mut scratch.dense_mlp.activated);
-        gemm     (&scratch.dense_mlp.activated  => &mut scratch.mla.projected,      dense.down_proj);
-    }
-    all_reduce_hidden_via_f32_in_place(
+    typed_ops::rms_norm_into(
+        ctx,
+        &scratch.mla.hidden,
+        post_attention_norm,
+        KIMI_K2_RMS_NORM_EPS,
+        &mut scratch.mla.normed,
+    )?;
+    typed_ops::gemm_dm_typed_to_hs_graphsafe(
+        ctx,
+        &dense.gate_up_proj,
+        &scratch.mla.normed,
+        &mut scratch.dense_mlp.gate_up,
+    )?;
+    typed_ops::silu_mul_hs_fused_into(
+        ctx,
+        &scratch.dense_mlp.gate_up,
+        &mut scratch.dense_mlp.activated,
+    )?;
+    typed_ops::gemm_dm_hs_to_typed_graphsafe(
+        ctx,
+        &dense.down_proj,
+        &scratch.dense_mlp.activated,
+        &mut scratch.mla.projected,
+    )?;
+    maybe_all_reduce_hidden_via_f32_in_place(
         ctx,
         &mut scratch.mla.projected,
         &mut scratch.comm.hidden_allreduce_f32,
@@ -320,7 +350,7 @@ pub(super) fn forward_dense_mlp_decode_into(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn forward_moe_layer_batch_into(
     ctx: &DeviceContext,
-    comm: &Comm,
+    comm: Option<&Comm>,
     layer_idx: usize,
     moe: &KimiMoeForwardCache,
     post_attention_norm: &NormWeight<KIMI_K2_HIDDEN>,
@@ -330,21 +360,30 @@ pub(super) fn forward_moe_layer_batch_into(
     next_hidden: &mut GpuTensor<KIMI_K2_HIDDEN>,
 ) -> Result<()> {
     let seq_len = hidden.seq_len;
-    pegainfer_kernels::typed_pipeline! {
-        ctx = ctx, eps = KIMI_K2_RMS_NORM_EPS, seq_len = seq_len, gemm = prefill;
-        tensor shared_gate_up: SHARED_GATE_UP_DIM;
-        tensor shared_activated: SHARED_ACTIVATED_DIM;
-        tensor shared_out: KIMI_K2_HIDDEN;
-
-        rms_norm(hidden => normed, post_attention_norm);
-        gemm(normed => &mut shared_gate_up, moe.shared_gate_up_proj);
-        silu_mul<SHARED_ACTIVATED_DIM>(&shared_gate_up => &mut shared_activated);
-        gemm(&shared_activated => &mut shared_out, moe.shared_down_proj);
+    typed_ops::rms_norm_into(
+        ctx,
+        hidden,
+        post_attention_norm,
+        KIMI_K2_RMS_NORM_EPS,
+        normed,
+    )?;
+    let mut shared_gate_up = HiddenStates::zeros(ctx, moe.shared_gate_up_proj.rows, seq_len)?;
+    typed_ops::gemm_dm_typed_to_hs(ctx, &moe.shared_gate_up_proj, normed, &mut shared_gate_up)?;
+    let mut shared_activated = HiddenStates::zeros(ctx, moe.shared_down_proj.cols, seq_len)?;
+    typed_ops::silu_mul_hs_fused_into(ctx, &shared_gate_up, &mut shared_activated)?;
+    let mut shared_out = GpuTensor::<KIMI_K2_HIDDEN>::zeros(ctx, seq_len)?;
+    typed_ops::gemm_dm_hs_to_typed(
+        ctx,
+        &moe.shared_down_proj,
+        &shared_activated,
+        &mut shared_out,
+    )?;
+    if let Some(comm) = comm {
+        comm.all_reduce_in_place(&mut shared_out.data, &ReduceOp::Sum)
+            .map_err(|err| {
+                anyhow::anyhow!("Kimi TP all-reduce bf16 hidden failed: status={:?}", err.0)
+            })?;
     }
-    comm.all_reduce_in_place(&mut shared_out.data, &ReduceOp::Sum)
-        .map_err(|err| {
-            anyhow::anyhow!("Kimi TP all-reduce bf16 hidden failed: status={:?}", err.0)
-        })?;
 
     let mut router_logits = ctx.stream.alloc_zeros(seq_len * KIMI_K2_ROUTED_EXPERTS)?;
     let mut router_scores = ctx.stream.alloc_zeros(seq_len * KIMI_K2_ROUTED_EXPERTS)?;
@@ -427,7 +466,10 @@ pub(super) fn forward_moe_layer_batch_into(
 
     let mut routed_out_f32 = ctx.stream.alloc_zeros(seq_len * KIMI_K2_HIDDEN)?;
     kimi_marlin_sum_topk_rows_f32(ctx, &expert_output, seq_len, &mut routed_out_f32)?;
-    all_reduce_f32_in_place(&mut routed_out_f32, comm)?;
+    let nccl_comm = comm.ok_or_else(|| {
+        anyhow::anyhow!("NCCL MoE batch routed path requires TP comm (use PPLX for TP1)")
+    })?;
+    all_reduce_f32_in_place(&mut routed_out_f32, nccl_comm)?;
     scale_f32_in_place(
         ctx,
         &mut routed_out_f32,
@@ -445,7 +487,7 @@ pub(super) fn forward_moe_layer_batch_into(
 pub(super) fn forward_moe_layer_decode_into(
     ctx: &DeviceContext,
     aux_ctx: &DeviceContext,
-    comm: &Comm,
+    comm: Option<&Comm>,
     layer_idx: usize,
     moe: &KimiMoeForwardCache,
     post_attention_norm: &NormWeight<KIMI_K2_HIDDEN>,
@@ -471,13 +513,24 @@ pub(super) fn forward_moe_layer_decode_into(
         .wait(&norm_ready)
         .with_context(|| format!("Kimi MoE layer {layer_idx} aux wait norm_ready"))?;
 
-    pegainfer_kernels::typed_pipeline! {
-        ctx = ctx, eps = KIMI_K2_RMS_NORM_EPS;
-        gemm     (&scratch.mla.normed           => &mut scratch.shared_expert.gate_up,  moe.shared_gate_up_proj);
-        silu_mul<SHARED_ACTIVATED_DIM> (&scratch.shared_expert.gate_up => &mut scratch.shared_expert.activated);
-        gemm     (&scratch.shared_expert.activated => &mut scratch.mla.projected,       moe.shared_down_proj);
-    }
-    all_reduce_hidden_via_f32_in_place(
+    typed_ops::gemm_dm_typed_to_hs_graphsafe(
+        ctx,
+        &moe.shared_gate_up_proj,
+        &scratch.mla.normed,
+        &mut scratch.shared_expert.gate_up,
+    )?;
+    typed_ops::silu_mul_hs_fused_into(
+        ctx,
+        &scratch.shared_expert.gate_up,
+        &mut scratch.shared_expert.activated,
+    )?;
+    typed_ops::gemm_dm_hs_to_typed_graphsafe(
+        ctx,
+        &moe.shared_down_proj,
+        &scratch.shared_expert.activated,
+        &mut scratch.mla.projected,
+    )?;
+    maybe_all_reduce_hidden_via_f32_in_place(
         ctx,
         &mut scratch.mla.projected,
         &mut scratch.comm.hidden_allreduce_f32,
@@ -578,6 +631,9 @@ pub(super) fn forward_moe_layer_decode_into(
     ctx.stream
         .wait(&routed_local_done)
         .with_context(|| format!("Kimi MoE layer {layer_idx} main wait routed_local_done"))?;
+    let nccl_comm = comm.ok_or_else(|| {
+        anyhow::anyhow!("NCCL MoE routed path requires TP comm (use PPLX for TP1)")
+    })?;
     reduce_scatter_f32_hidden_into(
         &scratch.comm.routed_reduce_scatter_send_f32,
         seq_len * KIMI_K2_EP_WORLD,
@@ -585,7 +641,7 @@ pub(super) fn forward_moe_layer_decode_into(
         &mut scratch.comm.routed_out_f32,
         seq_len,
         KIMI_K2_EP_WORLD,
-        comm,
+        nccl_comm,
     )?;
 
     typed_ops::add_into(

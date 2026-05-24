@@ -50,6 +50,8 @@ pub struct PplxBootstrapParams {
     pub expert_padding: usize,
     /// Optional override for `max_private_tokens` (combine-side staging).
     pub max_private_tokens: Option<usize>,
+    /// Output dtype produced by `combine_recv`.
+    pub out_dtype: ScalarType,
     /// How many NICs to bind per GPU (1 = NVLink-only intra-node).
     pub nets_per_gpu: u8,
     /// Imm-data base distinguishing this all-to-all on the fabric.
@@ -62,6 +64,7 @@ impl Default for PplxBootstrapParams {
             max_num_tokens: 8,
             expert_padding: 16,
             max_private_tokens: None,
+            out_dtype: ScalarType::BF16,
             nets_per_gpu: 1,
             imm_base: 0x80000000,
         }
@@ -482,7 +485,7 @@ fn run_phase2(
     let dtypes = EpDtypes {
         in_elemsize: sizing.in_elemsize,
         out_elemsize: sizing.out_elemsize,
-        out_dtype: ScalarType::BF16,
+        out_dtype: params.out_dtype,
         scale_elemsize: sizing.scale_elemsize,
     };
     let buffers = EpRankBuffers {

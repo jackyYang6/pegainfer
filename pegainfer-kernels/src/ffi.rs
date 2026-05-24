@@ -309,6 +309,7 @@ unsafe extern "C" {
         q_nope: *const Half,
         q_abs_nope: *mut Half,
         batch_size: i32,
+        local_heads: i32,
         stream: CUstream,
     ) -> i32;
 
@@ -317,6 +318,7 @@ unsafe extern "C" {
         latent: *const Half,
         output: *mut Half,
         batch_size: i32,
+        local_heads: i32,
         stream: CUstream,
     ) -> i32;
 

@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use pegainfer_core::parallel::ParallelConfig;
+
 use crate::runner::affinity::KimiRankThreadPlacementPlan;
 use crate::runner::worker::KimiK2RankPlacement;
 use crate::weights::{
@@ -10,6 +12,8 @@ use crate::weights::{
 #[derive(Clone, Debug)]
 pub struct KimiK2RunnerConfig {
     pub model_path: PathBuf,
+    pub parallel: ParallelConfig,
+    pub local_dims: crate::config::KimiLocalDims,
     pub weight_manifest: KimiK2WeightManifest,
     pub rank_weight_plans: Vec<KimiRankWeightPlan>,
     pub rank_weight_names: Vec<KimiRankWeightNames>,

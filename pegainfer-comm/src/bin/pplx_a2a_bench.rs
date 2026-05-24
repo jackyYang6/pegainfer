@@ -236,6 +236,7 @@ fn run_config(config: &BenchConfig) -> Result<Vec<Vec<IterTimes>>> {
         max_num_tokens: config.max_num_tokens,
         expert_padding: config.expert_padding,
         max_private_tokens: config.max_private_tokens,
+        out_dtype: ScalarType::BF16,
         nets_per_gpu: config.nets_per_gpu,
         imm_base: 0x8a2a_0000,
     };

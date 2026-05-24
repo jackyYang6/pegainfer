@@ -12,6 +12,19 @@ pub(in crate::runner) fn all_reduce_hidden_via_f32_in_place<const DIM: usize>(
     typed_ops::f32_to_bf16_into(ctx, f32_scratch, hidden)
 }
 
+pub(in crate::runner) fn maybe_all_reduce_hidden_via_f32_in_place<const DIM: usize>(
+    ctx: &DeviceContext,
+    hidden: &mut GpuTensor<DIM>,
+    f32_scratch: &mut CudaSlice<f32>,
+    comm: Option<&Comm>,
+) -> Result<()> {
+    if let Some(comm) = comm {
+        all_reduce_hidden_via_f32_in_place(ctx, hidden, f32_scratch, comm)
+    } else {
+        Ok(())
+    }
+}
+
 pub(super) fn all_reduce_f32_in_place(values: &mut CudaSlice<f32>, comm: &Comm) -> Result<()> {
     comm.all_reduce_in_place(values, &ReduceOp::Sum)
         .map(|_| ())

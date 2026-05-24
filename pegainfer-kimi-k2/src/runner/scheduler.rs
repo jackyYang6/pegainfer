@@ -1,5 +1,4 @@
 use std::{
-    cmp::Ordering,
     collections::{BTreeSet, VecDeque},
     path::Path,
     sync::{Arc, Barrier, mpsc as std_mpsc},
@@ -8,17 +7,23 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use pegainfer_core::engine::{
-    EngineHandle, EngineLoadOptions, FinishReason, GenerateRequest, TokenEvent,
+use pegainfer_core::{
+    engine::{EngineHandle, EngineLoadOptions, FinishReason, GenerateRequest, TokenEvent},
+    parallel::ParallelConfig,
 };
 use tokio::sync::mpsc;
 
+#[cfg(feature = "pplx-ep")]
+use crate::runner::{
+    engine::DpCoordinator, executor::Tp1Dp8ForwardExecutor, load_balancer::DpLoadBalancer,
+};
 use crate::{
-    config::{KIMI_K2_DENSE_LAYERS, KIMI_K2_LAYERS, KIMI_K2_MOE_LAYERS, KIMI_K2_VOCAB},
+    config::KimiK2ParallelShape,
     runner::{
         affinity::pin_scheduler_thread,
         config::KimiK2RunnerConfig,
-        worker::{KimiRankWeightLoadReport, KimiRankWorker, build_tp8_ep8_placements},
+        executor::{ForwardExecutor, Tp8Dp1ForwardExecutor},
+        worker::{KimiRankWeightLoadReport, KimiRankWorker, build_placements},
     },
     weights::{KimiRankGpuContext, KimiRankSlicedLoadPlan, ensure_text_only_model_index},
 };
@@ -26,14 +31,46 @@ use crate::{
 const KIMI_RUNNER_MAX_BATCH: usize = 4;
 
 pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<EngineHandle> {
-    if options.device_ordinals != (0..8).collect::<Vec<_>>() {
-        bail!(
-            "Kimi-K2 TP8/EP8 currently requires device_ordinals=0..7, got {:?}",
-            options.device_ordinals
-        );
+    let parallel = resolve_parallel_config(&options)?;
+    ensure!(
+        options.device_ordinals.len() == parallel.ep_world,
+        "Kimi-K2 {:?} requires {} devices, got {:?}",
+        parallel,
+        parallel.ep_world,
+        options.device_ordinals
+    );
+
+    match (parallel.tp_world, parallel.dp_world) {
+        (8, 1) => start_engine_tp8_dp1(model_path, options, parallel),
+        (1, _) => start_engine_tp1_dp(model_path, options, parallel),
+        _ => bail!(
+            "Kimi-K2 TP{}/DP{} not yet supported (v1: TP8DP1 or TP1DP8)",
+            parallel.tp_world,
+            parallel.dp_world
+        ),
     }
-    let weight_manifest = ensure_text_only_model_index(model_path)?;
-    let placements = build_tp8_ep8_placements(&options.device_ordinals)?;
+}
+
+fn resolve_parallel_config(_options: &EngineLoadOptions) -> Result<ParallelConfig> {
+    if let Ok(mode) = std::env::var("PEGAINFER_KIMI_PARALLEL") {
+        match mode.as_str() {
+            "tp8dp1" | "tp8_dp1" => return Ok(ParallelConfig::new(8, 1)),
+            "tp1dp8" | "tp1_dp8" => return Ok(ParallelConfig::new(1, 8)),
+            other => bail!("PEGAINFER_KIMI_PARALLEL={other}: expected tp8dp1 or tp1dp8"),
+        }
+    }
+    Ok(ParallelConfig::new(8, 1))
+}
+
+fn build_runner_config(
+    model_path: &Path,
+    options: &EngineLoadOptions,
+    parallel: ParallelConfig,
+    shape: KimiK2ParallelShape,
+) -> Result<KimiK2RunnerConfig> {
+    let mut weight_manifest = ensure_text_only_model_index(model_path)?;
+    weight_manifest = weight_manifest.with_parallel_shape(shape)?;
+    let placements = build_placements(&options.device_ordinals)?;
     let thread_placement = crate::runner::affinity::KimiRankThreadPlacementPlan::for_devices(
         &options.device_ordinals,
     )?;
@@ -53,8 +90,10 @@ pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Res
     let pplx_thread_placement = pegainfer_core::cpu_topology::RankThreadPlacementPlan::for_devices(
         &options.device_ordinals,
     )?;
-    let runtime_config = KimiK2RunnerConfig {
+    Ok(KimiK2RunnerConfig {
         model_path: model_path.to_path_buf(),
+        parallel,
+        local_dims: shape.local_dims(),
         weight_manifest,
         rank_weight_plans,
         rank_weight_names,
@@ -65,7 +104,20 @@ pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Res
         #[cfg(feature = "pplx-ep")]
         pplx_thread_placement,
         enable_cuda_graph: options.enable_cuda_graph,
-    };
+    })
+}
+
+fn start_engine_tp8_dp1(
+    model_path: &Path,
+    options: EngineLoadOptions,
+    parallel: ParallelConfig,
+) -> Result<EngineHandle> {
+    let runtime_config = build_runner_config(
+        model_path,
+        &options,
+        parallel,
+        KimiK2ParallelShape::tp8_ep8(),
+    )?;
 
     let (submit_tx, submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
     let (init_tx, init_rx) = std_mpsc::channel::<Result<()>>();
@@ -91,6 +143,65 @@ pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Res
         submit_tx,
         scheduler_handle,
     ))
+}
+
+#[cfg(not(feature = "pplx-ep"))]
+fn start_engine_tp1_dp(
+    _model_path: &Path,
+    _options: EngineLoadOptions,
+    _parallel: ParallelConfig,
+) -> Result<EngineHandle> {
+    bail!("Kimi-K2 TP1 DP requires pplx-ep feature (PPLX is the only EP backend for TP1)")
+}
+
+#[cfg(feature = "pplx-ep")]
+fn start_engine_tp1_dp(
+    model_path: &Path,
+    options: EngineLoadOptions,
+    parallel: ParallelConfig,
+) -> Result<EngineHandle> {
+    let dp_world = parallel.dp_world;
+    let runtime_config = build_runner_config(
+        model_path,
+        &options,
+        parallel,
+        KimiK2ParallelShape::tp1_dp8(),
+    )?;
+
+    let workers = spawn_workers(&runtime_config)?;
+    let weight_reports = maybe_load_rank_weights(
+        &runtime_config.model_path,
+        &runtime_config.rank_sliced_load_plans,
+        &workers,
+    )?;
+    install_pplx_backends(&runtime_config, &workers)?;
+
+    let mut executors: Vec<Box<dyn ForwardExecutor + Send>> = Vec::with_capacity(dp_world);
+    for (worker, weight_report) in workers.into_iter().zip(weight_reports.into_iter()) {
+        executors.push(Box::new(Tp1Dp8ForwardExecutor {
+            worker,
+            weight_report,
+        }));
+    }
+
+    let coordinator = DpCoordinator::new(executors);
+    let lb = DpLoadBalancer::new(dp_world);
+
+    let (submit_tx, submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
+    let (init_tx, init_rx) = std_mpsc::channel::<Result<()>>();
+    let coord_handle = thread::Builder::new()
+        .name("kimi-k2-dp-coord".into())
+        .spawn(move || {
+            let _ = init_tx.send(Ok(()));
+            coordinator.run(submit_rx, lb);
+        })
+        .map_err(|err| anyhow::anyhow!("failed to spawn Kimi-K2 DP coordinator: {err}"))?;
+    init_rx
+        .recv()
+        .map_err(|err| anyhow::anyhow!("Kimi-K2 DP coordinator init failed: {err}"))??;
+
+    eprintln!("kimi-k2: TP1 DP{dp_world} coordinated engine started");
+    Ok(EngineHandle::new_with_join_handle(submit_tx, coord_handle))
 }
 
 struct KimiK2Scheduler {
@@ -321,165 +432,39 @@ impl KimiK2Scheduler {
 }
 
 struct KimiK2Runtime {
-    config: KimiK2RunnerConfig,
-    workers: Vec<KimiRankWorker>,
-    rank_weight_reports: Vec<KimiRankWeightLoadReport>,
+    executor: Tp8Dp1ForwardExecutor,
 }
 
 impl KimiK2Runtime {
     fn spawn(config: KimiK2RunnerConfig) -> Result<Self> {
-        if config.rank_weight_plans.len() != config.placements.len() {
-            bail!(
-                "Kimi-K2 rank weight plan count {} must match placements {}",
-                config.rank_weight_plans.len(),
-                config.placements.len()
-            );
-        }
-        if config.rank_weight_names.len() != config.placements.len() {
-            bail!(
-                "Kimi-K2 rank weight names count {} must match placements {}",
-                config.rank_weight_names.len(),
-                config.placements.len()
-            );
-        }
-        if config.rank_shard_plans.len() != config.placements.len() {
-            bail!(
-                "Kimi-K2 rank shard plan count {} must match placements {}",
-                config.rank_shard_plans.len(),
-                config.placements.len()
-            );
-        }
-        if config.rank_sliced_load_plans.len() != config.placements.len() {
-            bail!(
-                "Kimi-K2 rank sliced load plan count {} must match placements {}",
-                config.rank_sliced_load_plans.len(),
-                config.placements.len()
-            );
-        }
-        let contexts = config
-            .placements
-            .iter()
-            .map(|placement| KimiRankGpuContext::new(placement.device_ordinal))
-            .collect::<Result<Vec<_>>>()?;
-        let mut workers = Vec::with_capacity(config.placements.len());
-        let collective_barrier = Arc::new(Barrier::new(config.placements.len()));
-        for (((((&placement, weight_plan), weight_names), shard_plan), sliced_load_plan), ctx) in
-            config
-                .placements
-                .iter()
-                .zip(config.rank_weight_plans.iter().cloned())
-                .zip(config.rank_weight_names.iter().cloned())
-                .zip(config.rank_shard_plans.iter().cloned())
-                .zip(config.rank_sliced_load_plans.iter().cloned())
-                .zip(contexts.into_iter())
-        {
-            let thread_placement = config.thread_placement.rank(placement.rank)?;
-            let worker = KimiRankWorker::spawn(
-                placement,
-                weight_plan,
-                weight_names,
-                shard_plan,
-                sliced_load_plan,
-                thread_placement,
-                ctx,
-                Arc::clone(&collective_barrier),
-                config.enable_cuda_graph,
-            )?;
-            debug_assert_eq!(worker.placement(), placement);
-            debug_assert_eq!(worker.weight_plan().rank, placement.rank);
-            debug_assert_eq!(worker.weight_names().rank, placement.rank);
-            debug_assert_eq!(worker.shard_plan().rank, placement.rank);
-            debug_assert_eq!(worker.sliced_load_plan().rank, placement.rank);
-            debug_assert_eq!(worker.thread_placement().rank, placement.rank);
-            workers.push(worker);
-        }
+        let workers = spawn_workers(&config)?;
         let rank_weight_reports =
             maybe_load_rank_weights(&config.model_path, &config.rank_sliced_load_plans, &workers)?;
-        // Temporary NCCL bridge: this communicator is used both for normal
-        // TP sums and for Kimi MoE shared/routed combine sums. It is not a
-        // PPLX EP backend; production EP dispatch/combine must replace the
-        // MoE-side all-reduce call sites explicitly. Initialize each NCCL
-        // rank inside its persistent worker thread so the communicator is
-        // created under the same CUDA context and stream that will enqueue
-        // decode collectives.
-        let nccl_id = cudarc::nccl::safe::Id::new()
-            .map_err(|err| anyhow::anyhow!("Kimi TP NCCL unique id creation failed: {err:?}"))?;
-        let comm_receivers = workers
-            .iter()
-            .map(|worker| worker.init_tp_comm_async(nccl_id, workers.len()))
-            .collect::<Result<Vec<_>>>()?;
-        for (rank, receiver) in comm_receivers.into_iter().enumerate() {
-            receiver
-                .recv()
-                .map_err(|_| anyhow::anyhow!("Kimi rank {rank} dropped TP comm init response"))?
-                .with_context(|| format!("Kimi rank {rank} TP comm init"))?;
-        }
+        init_tp_nccl(&workers)?;
 
         #[cfg(feature = "pplx-ep")]
         {
-            let ep_shape = pegainfer_comm::bootstrap::EpModelShape {
-                n_routed_experts: crate::config::KIMI_K2_ROUTED_EXPERTS,
-                n_activated_experts: crate::config::KIMI_K2_TOPK,
-                hidden_dim: crate::config::KIMI_K2_HIDDEN,
-            };
-            let devices: Vec<usize> = config.placements.iter().map(|p| p.device_ordinal).collect();
-            let pplx_params = pegainfer_comm::bootstrap::PplxBootstrapParams {
-                expert_padding: crate::runner::moe_pplx::PPLX_EXPERT_PADDING,
-                ..pegainfer_comm::bootstrap::PplxBootstrapParams::default()
-            };
-            match pegainfer_comm::bootstrap::build_intra_node_backends(
-                ep_shape,
-                &devices,
-                &config.pplx_thread_placement,
-                pplx_params,
-            ) {
-                Ok((backends, resources)) => {
-                    std::mem::forget(resources);
-                    let pplx_receivers = workers
-                        .iter()
-                        .zip(backends)
-                        .map(|(worker, backend)| worker.enable_pplx_async(backend))
-                        .collect::<Result<Vec<_>>>()?;
-                    for (rank, receiver) in pplx_receivers.into_iter().enumerate() {
-                        receiver
-                            .recv()
-                            .map_err(|_| {
-                                anyhow::anyhow!("Kimi rank {rank} dropped PPLX enable response")
-                            })?
-                            .with_context(|| format!("Kimi rank {rank} PPLX EP backend enable"))?;
-                    }
-                    eprintln!(
-                        "kimi-k2: pplx EP backends installed on all {} ranks",
-                        workers.len()
-                    );
-                }
-                Err(err) => {
-                    eprintln!("kimi-k2: pplx EP bootstrap failed, falling back to NCCL: {err:#}");
-                }
-            }
+            install_pplx_backends(&config, &workers)?;
+            eprintln!(
+                "kimi-k2: pplx EP backends installed on all {} ranks",
+                workers.len()
+            );
         }
 
-        Ok(Self {
-            config,
+        let executor = Tp8Dp1ForwardExecutor {
             workers,
-            rank_weight_reports,
-        })
+            weight_reports: rank_weight_reports,
+        };
+        let _ = config;
+        Ok(Self { executor })
     }
 
     fn rank_count(&self) -> usize {
-        debug_assert_eq!(self.workers.len(), self.config.placements.len());
-        debug_assert_eq!(
-            self.config.weight_manifest.layers.len(),
-            crate::config::KIMI_K2_LAYERS
-        );
-        self.workers.len()
+        self.executor.worker_count()
     }
 
     fn gpu_weight_ready_rank_count(&self) -> usize {
-        self.rank_weight_reports
-            .iter()
-            .filter(|report| report.loaded_to_gpu && report.typed_view_validated)
-            .count()
+        self.executor.gpu_weight_ready_count()
     }
 
     fn forward_prompt_next_token_in_slot(
@@ -488,39 +473,8 @@ impl KimiK2Runtime {
         slot: usize,
         decode_batch_size: usize,
     ) -> Result<crate::runner::worker::KimiOneTokenForwardReport> {
-        if self.workers.is_empty() {
-            bail!("Kimi runtime has no rank workers");
-        }
-        let responses = self
-            .workers
-            .iter()
-            .map(|worker| {
-                worker.forward_prompt_next_token_async(input_ids.clone(), slot, decode_batch_size)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let mut reports = Vec::with_capacity(responses.len());
-        for response in responses {
-            reports.push(
-                response.recv().map_err(|_| {
-                    anyhow::anyhow!("Kimi-K2 rank worker dropped forward response")
-                })??,
-            );
-        }
-        let expected_input = input_ids
-            .last()
-            .copied()
-            .ok_or_else(|| anyhow::anyhow!("Kimi prompt report validation requires input token"))?;
-        for report in &reports {
-            validate_one_token_report(report, "prompt", slot, expected_input)?;
-        }
-        reports
-            .into_iter()
-            .max_by(|left, right| {
-                left.local_top_logit_f32
-                    .partial_cmp(&right.local_top_logit_f32)
-                    .unwrap_or(Ordering::Equal)
-            })
-            .ok_or_else(|| anyhow::anyhow!("Kimi runtime produced no rank forward reports"))
+        self.executor
+            .forward_prefill(&input_ids, slot, decode_batch_size, 0)
     }
 
     fn forward_decode_batch_next_tokens(
@@ -530,152 +484,8 @@ impl KimiK2Runtime {
         slots: Vec<usize>,
         decode_batch_size: usize,
     ) -> Result<Vec<crate::runner::worker::KimiOneTokenForwardReport>> {
-        if self.workers.is_empty() {
-            bail!("Kimi runtime has no rank workers");
-        }
-        if token_ids.is_empty() {
-            bail!("Kimi batch decode requires at least one token");
-        }
-        if token_ids.len() != append_positions.len() || token_ids.len() != slots.len() {
-            bail!(
-                "Kimi batch decode input mismatch: tokens={}, positions={}, slots={}",
-                token_ids.len(),
-                append_positions.len(),
-                slots.len()
-            );
-        }
-        let responses = self
-            .workers
-            .iter()
-            .map(|worker| {
-                worker.forward_decode_batch_next_tokens_async(
-                    token_ids.clone(),
-                    append_positions.clone(),
-                    slots.clone(),
-                    decode_batch_size,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let mut rank_reports = Vec::with_capacity(responses.len());
-        for response in responses {
-            rank_reports.push(response.recv().map_err(|_| {
-                anyhow::anyhow!("Kimi-K2 rank worker dropped batch decode response")
-            })??);
-        }
-        let shard_count = rank_reports.len();
-        ensure!(
-            shard_count == self.workers.len(),
-            "Kimi batch decode received {} rank report sets for {} workers",
-            shard_count,
-            self.workers.len()
-        );
-        for (rank_idx, reports) in rank_reports.iter().enumerate() {
-            ensure!(
-                reports.len() == token_ids.len(),
-                "Kimi rank {rank_idx} returned {} decode reports for {} active rows",
-                reports.len(),
-                token_ids.len()
-            );
-            for (row, report) in reports.iter().enumerate() {
-                validate_one_token_report(report, "decode", slots[row], token_ids[row])?;
-            }
-        }
-        let mut selected = Vec::with_capacity(token_ids.len());
-        for row in 0..token_ids.len() {
-            let best = rank_reports
-                .iter()
-                .map(|reports| reports[row].clone())
-                .max_by(|left, right| {
-                    left.local_top_logit_f32
-                        .partial_cmp(&right.local_top_logit_f32)
-                        .unwrap_or(Ordering::Equal)
-                })
-                .ok_or_else(|| anyhow::anyhow!("Kimi runtime produced no report for row {row}"))?;
-            selected.push(best);
-        }
-        Ok(selected)
-    }
-}
-
-fn validate_one_token_report(
-    report: &crate::runner::worker::KimiOneTokenForwardReport,
-    phase: &str,
-    expected_slot: usize,
-    expected_input_token: u32,
-) -> Result<()> {
-    ensure!(
-        report.batch_slot == expected_slot,
-        "Kimi {phase} rank {} report slot mismatch: got {}, expected {}",
-        report.rank,
-        report.batch_slot,
-        expected_slot
-    );
-    ensure!(
-        report.input_token_id == expected_input_token,
-        "Kimi {phase} rank {} report input token mismatch: got {}, expected {}",
-        report.rank,
-        report.input_token_id,
-        expected_input_token
-    );
-    ensure!(
-        report.vocab_rows > 0 && report.vocab_start + report.vocab_rows <= KIMI_K2_VOCAB,
-        "Kimi {phase} rank {} report invalid vocab shard: start={}, rows={}, vocab={}",
-        report.rank,
-        report.vocab_start,
-        report.vocab_rows,
-        KIMI_K2_VOCAB
-    );
-    ensure!(
-        (report.local_next_token_id as usize) < report.vocab_rows,
-        "Kimi {phase} rank {} local token {} outside shard rows {}",
-        report.rank,
-        report.local_next_token_id,
-        report.vocab_rows
-    );
-    ensure!(
-        report.local_next_token_global_id as usize
-            == report.vocab_start + report.local_next_token_id as usize,
-        "Kimi {phase} rank {} global token mismatch: got {}, expected {}",
-        report.rank,
-        report.local_next_token_global_id,
-        report.vocab_start + report.local_next_token_id as usize
-    );
-    ensure!(
-        report.local_top_logit_f32.is_finite(),
-        "Kimi {phase} rank {} report has non-finite top logit {}",
-        report.rank,
-        report.local_top_logit_f32
-    );
-    ensure!(
-        report.dense_layers_executed == KIMI_K2_DENSE_LAYERS,
-        "Kimi {phase} rank {} dense layer count mismatch: got {}, expected {}",
-        report.rank,
-        report.dense_layers_executed,
-        KIMI_K2_DENSE_LAYERS
-    );
-    ensure!(
-        report.moe_layers_executed == KIMI_K2_MOE_LAYERS,
-        "Kimi {phase} rank {} MoE layer count mismatch: got {}, expected {}",
-        report.rank,
-        report.moe_layers_executed,
-        KIMI_K2_MOE_LAYERS
-    );
-    ensure!(
-        report.dense_layers_executed + report.moe_layers_executed == KIMI_K2_LAYERS,
-        "Kimi {phase} rank {} executed layer count mismatch: dense {} + moe {} != {}",
-        report.rank,
-        report.dense_layers_executed,
-        report.moe_layers_executed,
-        KIMI_K2_LAYERS
-    );
-    Ok(())
-}
-
-impl Drop for KimiK2Runtime {
-    fn drop(&mut self) {
-        for worker in &mut self.workers {
-            let _ = worker.shutdown();
-        }
+        self.executor
+            .forward_decode_batch(&token_ids, &append_positions, &slots, decode_batch_size)
     }
 }
 
@@ -716,6 +526,102 @@ fn maybe_load_rank_weights(
     Ok(reports)
 }
 
+fn spawn_workers(config: &KimiK2RunnerConfig) -> Result<Vec<KimiRankWorker>> {
+    let n = config.placements.len();
+    ensure!(
+        config.rank_weight_plans.len() == n
+            && config.rank_weight_names.len() == n
+            && config.rank_shard_plans.len() == n
+            && config.rank_sliced_load_plans.len() == n,
+        "Kimi-K2 plan/names/shard/sliced counts must match {} placements",
+        n
+    );
+    let contexts = config
+        .placements
+        .iter()
+        .map(|placement| KimiRankGpuContext::new(placement.device_ordinal))
+        .collect::<Result<Vec<_>>>()?;
+    let collective_barrier = Arc::new(Barrier::new(config.parallel.tp_world));
+    let mut workers = Vec::with_capacity(n);
+    for (((((&placement, weight_plan), weight_names), shard_plan), sliced_load_plan), ctx) in config
+        .placements
+        .iter()
+        .zip(config.rank_weight_plans.iter().cloned())
+        .zip(config.rank_weight_names.iter().cloned())
+        .zip(config.rank_shard_plans.iter().cloned())
+        .zip(config.rank_sliced_load_plans.iter().cloned())
+        .zip(contexts.into_iter())
+    {
+        let thread_placement = config.thread_placement.rank(placement.rank)?;
+        let worker = KimiRankWorker::spawn(
+            placement,
+            weight_plan,
+            weight_names,
+            shard_plan,
+            sliced_load_plan,
+            thread_placement,
+            config.local_dims,
+            ctx,
+            Arc::clone(&collective_barrier),
+            config.enable_cuda_graph,
+        )?;
+        debug_assert_eq!(worker.placement(), placement);
+        workers.push(worker);
+    }
+    Ok(workers)
+}
+
+fn init_tp_nccl(workers: &[KimiRankWorker]) -> Result<()> {
+    let nccl_id = cudarc::nccl::safe::Id::new()
+        .map_err(|err| anyhow::anyhow!("Kimi TP NCCL unique id creation failed: {err:?}"))?;
+    let comm_receivers = workers
+        .iter()
+        .map(|worker| worker.init_tp_comm_async(nccl_id, workers.len()))
+        .collect::<Result<Vec<_>>>()?;
+    for (rank, receiver) in comm_receivers.into_iter().enumerate() {
+        receiver
+            .recv()
+            .map_err(|_| anyhow::anyhow!("Kimi rank {rank} dropped TP comm init response"))?
+            .with_context(|| format!("Kimi rank {rank} TP comm init"))?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "pplx-ep")]
+fn install_pplx_backends(config: &KimiK2RunnerConfig, workers: &[KimiRankWorker]) -> Result<()> {
+    let ep_shape = pegainfer_comm::bootstrap::EpModelShape {
+        n_routed_experts: crate::config::KIMI_K2_ROUTED_EXPERTS,
+        n_activated_experts: crate::config::KIMI_K2_TOPK,
+        hidden_dim: crate::config::KIMI_K2_HIDDEN,
+    };
+    let devices: Vec<usize> = config.placements.iter().map(|p| p.device_ordinal).collect();
+    let pplx_params = pegainfer_comm::bootstrap::PplxBootstrapParams {
+        max_num_tokens: 2048,
+        expert_padding: crate::runner::moe_pplx::PPLX_EXPERT_PADDING,
+        out_dtype: pegainfer_comm::ScalarType::F32,
+        ..pegainfer_comm::bootstrap::PplxBootstrapParams::default()
+    };
+    let (backends, resources) = pegainfer_comm::bootstrap::build_intra_node_backends(
+        ep_shape,
+        &devices,
+        &config.pplx_thread_placement,
+        pplx_params,
+    )?;
+    std::mem::forget(resources);
+    let pplx_receivers = workers
+        .iter()
+        .zip(backends)
+        .map(|(worker, backend)| worker.enable_pplx_async(backend))
+        .collect::<Result<Vec<_>>>()?;
+    for (rank, receiver) in pplx_receivers.into_iter().enumerate() {
+        receiver
+            .recv()
+            .map_err(|_| anyhow::anyhow!("Kimi rank {rank} dropped PPLX enable response"))?
+            .with_context(|| format!("Kimi rank {rank} PPLX EP backend enable"))?;
+    }
+    Ok(())
+}
+
 fn ensure_weight_payload_available(
     model_path: &Path,
     load_plans: &[KimiRankSlicedLoadPlan],
@@ -743,14 +649,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn placements_require_eight_ranks() {
-        let err = build_tp8_ep8_placements(&[0, 1, 2]).unwrap_err();
-        assert!(err.to_string().contains("exactly 8"));
-    }
-
-    #[test]
     fn placements_map_rank_to_device() {
-        let placements = build_tp8_ep8_placements(&(0..8).collect::<Vec<_>>()).unwrap();
+        let placements = build_placements(&(0..8).collect::<Vec<_>>()).unwrap();
         assert_eq!(placements[0].rank, 0);
         assert_eq!(placements[7].device_ordinal, 7);
     }

@@ -383,7 +383,7 @@ pub fn validate_attention_tp_collective(
     tensors: AttentionTpTensors,
     _stream: StreamHandle,
 ) -> HeaderResult<()> {
-    validate_tp8_ep8(plan)?;
+    validate_parallel_plan(plan)?;
     validate_padded_batch(batch)?;
     expect_bf16(tensors.q_local.dtype, "q_local")?;
     expect_bf16(tensors.kv_a_replicated.dtype, "kv_a_replicated")?;
@@ -631,7 +631,7 @@ pub fn validate_logits_all_gather(
     tensors: LogitsAllGatherTensors,
     _stream: StreamHandle,
 ) -> HeaderResult<()> {
-    validate_tp8_ep8(plan)?;
+    validate_parallel_plan(plan)?;
     if local_tokens > padded_batch_size {
         return shape_err("local_tokens must not exceed padded_batch_size");
     }
@@ -659,6 +659,11 @@ pub fn validate_logits_all_gather(
 #[must_use]
 pub fn attention_tp_policy(shape: KimiK2ParallelShape) -> AttentionTpPolicy {
     let local_heads = KIMI_K2_HEADS / shape.tp_world;
+    let post_op = if shape.tp_world > 1 {
+        TpPostOp::AllReduceSum
+    } else {
+        TpPostOp::None
+    };
     AttentionTpPolicy {
         total_heads: KIMI_K2_HEADS,
         local_heads,
@@ -669,12 +674,13 @@ pub fn attention_tp_policy(shape: KimiK2ParallelShape) -> AttentionTpPolicy {
         q_proj_local_out: KIMI_K2_Q_PROJ_OUT / shape.tp_world,
         kv_b_local_out: crate::config::KIMI_K2_KV_B_OUT / shape.tp_world,
         o_proj_partial_out: KIMI_K2_HIDDEN,
-        o_proj_post_op: TpPostOp::AllReduceSum,
+        o_proj_post_op: post_op,
     }
 }
 
 #[must_use]
 pub fn dense_tp_policies(shape: KimiK2ParallelShape) -> Vec<TpShardPolicy> {
+    let reduce = tp_reduce_op(shape);
     vec![
         column_policy(
             TensorParallelRole::DenseMlp,
@@ -696,13 +702,14 @@ pub fn dense_tp_policies(shape: KimiK2ParallelShape) -> Vec<TpShardPolicy> {
             crate::config::KIMI_K2_DENSE_INTERMEDIATE,
             KIMI_K2_HIDDEN,
             shape.tp_world,
-            TpPostOp::AllReduceSum,
+            reduce,
         ),
     ]
 }
 
 #[must_use]
 pub fn shared_expert_tp_policies(shape: KimiK2ParallelShape) -> Vec<TpShardPolicy> {
+    let reduce = tp_reduce_op(shape);
     vec![
         column_policy(
             TensorParallelRole::SharedExpert,
@@ -724,9 +731,17 @@ pub fn shared_expert_tp_policies(shape: KimiK2ParallelShape) -> Vec<TpShardPolic
             KIMI_K2_EXPERT_INTERMEDIATE,
             KIMI_K2_HIDDEN,
             shape.tp_world,
-            TpPostOp::AllReduceSum,
+            reduce,
         ),
     ]
+}
+
+fn tp_reduce_op(shape: KimiK2ParallelShape) -> TpPostOp {
+    if shape.tp_world > 1 {
+        TpPostOp::AllReduceSum
+    } else {
+        TpPostOp::None
+    }
 }
 
 #[must_use]
@@ -797,10 +812,7 @@ fn row_policy(
     }
 }
 
-fn validate_tp8_ep8(plan: &ParallelPlan) -> HeaderResult<()> {
-    if plan.shape.tp_world != 8 || plan.shape.ep_world != 8 {
-        return shape_err("Kimi-K2.6 draft currently targets TP8/EP8 only");
-    }
+fn validate_parallel_plan(plan: &ParallelPlan) -> HeaderResult<()> {
     if plan.tp_rank.rank >= plan.tp_rank.world {
         return shape_err("tp rank must be smaller than tp world");
     }
@@ -849,8 +861,8 @@ fn validate_ep_common(
     topk: usize,
     hidden_dim: usize,
 ) -> HeaderResult<()> {
-    if ep_world != 8 {
-        return shape_err("Kimi-K2.6 EP plan currently targets EP8 only");
+    if ep_world == 0 || KIMI_K2_ROUTED_EXPERTS % ep_world != 0 {
+        return shape_err("EP world must evenly divide routed expert count");
     }
     if global_experts != KIMI_K2_ROUTED_EXPERTS {
         return shape_err("unexpected Kimi-K2.6 routed expert count");

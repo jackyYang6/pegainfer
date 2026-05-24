@@ -9,6 +9,7 @@ autotests = false
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true, optional = true }
+crossbeam-channel = { workspace = true }
 cudarc = { workspace = true, features = ["nccl"] }
 half = { workspace = true }
 memmap2 = { workspace = true }

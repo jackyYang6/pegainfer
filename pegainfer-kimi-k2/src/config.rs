@@ -370,26 +370,74 @@ fn ensure_float_close(actual: f64, expected: f64, tolerance: f64, label: &str) -
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KimiK2ParallelShape {
     pub tp_world: usize,
+    pub dp_world: usize,
     pub ep_world: usize,
     pub heads_per_tp: usize,
     pub local_experts: usize,
     pub vocab_per_tp: usize,
 }
 
+/// TP-local tensor dimensions derived from `KimiK2ParallelShape`.
+/// All fields scale with `heads_per_tp` or `tp_world`.
+#[derive(Clone, Copy, Debug)]
+pub struct KimiLocalDims {
+    pub local_heads: usize,
+    pub q_proj_out: usize,
+    pub kv_b_out: usize,
+    pub o_proj_in: usize,
+    pub q_nope_out: usize,
+    pub q_pe_out: usize,
+    pub abs_q_out: usize,
+    pub dense_gate_up: usize,
+    pub dense_activated: usize,
+    pub shared_gate_up: usize,
+    pub shared_activated: usize,
+}
+
 impl KimiK2ParallelShape {
     #[must_use]
     pub fn tp8_ep8() -> Self {
-        Self::new(8, 8)
+        Self::new(8, 1)
     }
 
     #[must_use]
-    pub fn new(tp_world: usize, ep_world: usize) -> Self {
+    pub fn tp1_dp8() -> Self {
+        Self::new(1, 8)
+    }
+
+    #[must_use]
+    pub fn new(tp_world: usize, dp_world: usize) -> Self {
+        let ep_world = tp_world * dp_world;
         Self {
             tp_world,
+            dp_world,
             ep_world,
             heads_per_tp: KIMI_K2_HEADS / tp_world,
             local_experts: KIMI_K2_ROUTED_EXPERTS / ep_world,
             vocab_per_tp: KIMI_K2_VOCAB / tp_world,
         }
+    }
+
+    #[must_use]
+    pub fn local_dims(&self) -> KimiLocalDims {
+        let h = self.heads_per_tp;
+        KimiLocalDims {
+            local_heads: h,
+            q_proj_out: h * KIMI_K2_Q_HEAD_DIM,
+            kv_b_out: h * (KIMI_K2_QK_NOPE_HEAD_DIM + KIMI_K2_V_HEAD_DIM),
+            o_proj_in: h * KIMI_K2_V_HEAD_DIM,
+            q_nope_out: h * KIMI_K2_QK_NOPE_HEAD_DIM,
+            q_pe_out: h * KIMI_K2_QK_ROPE_HEAD_DIM,
+            abs_q_out: h * KIMI_K2_KV_LORA_RANK,
+            dense_gate_up: 2 * KIMI_K2_DENSE_INTERMEDIATE / self.tp_world,
+            dense_activated: KIMI_K2_DENSE_INTERMEDIATE / self.tp_world,
+            shared_gate_up: 2 * KIMI_K2_EXPERT_INTERMEDIATE / self.tp_world,
+            shared_activated: KIMI_K2_EXPERT_INTERMEDIATE / self.tp_world,
+        }
+    }
+
+    #[must_use]
+    pub fn parallel_config(&self) -> pegainfer_core::parallel::ParallelConfig {
+        pegainfer_core::parallel::ParallelConfig::new(self.tp_world, self.dp_world)
     }
 }

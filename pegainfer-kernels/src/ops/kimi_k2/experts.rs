@@ -1552,23 +1552,16 @@ pub fn kimi_marlin_sum_topk_rows_f32<const DIM: usize>(
 /// computes padded expert layout, and fills `sorted_token_ids`, `expert_ids`,
 /// and `num_tokens_post_padded` directly on the GPU — zero D2H.
 ///
-/// `seq_len` is the actual batch size for this decode step.  A tight upper
-/// bound on the total padded tokens is computed on the host:
-///
-///     tight = min(seq_len × topk, local_experts) × expert_padding
-///
-/// This replaces `pplx_recv_capacity` as `route_elems` / `max_padded_tokens`,
-/// shrinking Marlin lock clearing, SwiGLU grid, and routing-kernel fill from
-/// 3072 → 512 at bs=1.  The CUDA kernel writes the *actual* total to
-/// `num_tokens_post_padded[0]`; Marlin and `swiglu_w13_pplx` read it
-/// on-device to skip the remaining padding within `tight`.
+/// PPLX can receive a skewed set of routes from every EP rank, so the host-side
+/// bound uses the full receive capacity. The CUDA kernel writes the actual
+/// padded total to `num_tokens_post_padded[0]`; Marlin and `swiglu_w13_pplx`
+/// read it on-device to skip sentinel rows within that capacity.
 pub fn kimi_pplx_build_marlin_routing_on_stream<'a>(
     ctx: &DeviceContext,
     workspace: &'a mut KimiMarlinRouteWorkspace,
     recv_tokens_per_expert: &CudaSlice<i32>,
     expert_padding: usize,
     pplx_recv_capacity: usize,
-    seq_len: usize,
 ) -> Result<KimiMarlinRouting<'a>> {
     ensure!(expert_padding > 0, "pplx expert_padding must be positive");
     ensure!(
@@ -1592,10 +1585,10 @@ pub fn kimi_pplx_build_marlin_routing_on_stream<'a>(
 
     let block_size = workspace.block_size;
 
-    // Host-side tight upper bound: at most min(seq_len*topk, local_experts)
-    // distinct experts receive tokens, each padded to expert_padding.
-    let max_nonzero_experts = (seq_len * KIMI_K2_TOPK).min(KIMI_K2_LOCAL_EXPERTS);
-    let tight_max = (max_nonzero_experts * expert_padding).min(pplx_recv_capacity);
+    // Use full recv capacity: PPLX receives tokens from ALL ranks, so any
+    // expert can get many tokens. The GPU kernel writes the actual count to
+    // num_tokens_post_padded[0]; Marlin skips sentinel-filled blocks.
+    let tight_max = pplx_recv_capacity;
     let tight_m_blocks = tight_max.div_ceil(block_size);
 
     {
@@ -1672,8 +1665,8 @@ pub fn kimi_marlin_wna16_pplx_w13_gemm<const IN: usize, const OUT: usize>(
     )
 }
 
-/// W2 (down) GEMM for PPLX path: top_k=1, no weight scaling.
-/// combine_recv handles the topk weight reduction.
+/// W2 (down) GEMM for PPLX path: top_k=1 with one top-k weight per
+/// expert-major row. This matches the NCCL path's BF16 rounding boundary.
 pub fn kimi_marlin_wna16_pplx_w2_gemm<const IN: usize, const OUT: usize>(
     ctx: &DeviceContext,
     workspace: &mut KimiMarlinWna16Workspace,
@@ -1706,7 +1699,7 @@ pub fn kimi_marlin_wna16_pplx_w2_gemm<const IN: usize, const OUT: usize>(
         topk_weight,
         &mut output.data,
         1,
-        false,
+        true,
         routing.route_elems,
         OUT,
         IN,
