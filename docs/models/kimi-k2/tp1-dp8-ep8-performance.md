@@ -1,6 +1,6 @@
 # Kimi-K2 TP1 DP8 EP8 performance
 
-> TL;DR: This ledger tracks pegainfer TP1+DP8+EP8 on 8x H20 against the vLLM TP1+DP8+EP8 bs64 target. Every optimization must start from a profile, state the expected gain, show a microbench or isolated measurement, then pass correctness and service-level gates before commit.
+> TL;DR: This ledger tracks pegainfer TP1+DP8+EP8 on 8x H20 against the vLLM TP1+DP8+EP8 bs64 target. The vLLM sustained bs64 `~106ms` TPOT is now explained by a DPLB/CUDA-graph bucket cliff: an uneven DP distribution such as `9,8,8,8,8,8,8,7` pads every rank from graph bucket 8 to 16 and doubles TPOT. Every pegainfer optimization must start from a profile, state the expected gain, show a microbench or isolated measurement, then pass correctness and service-level gates before commit.
 >
 > Last touched: 2026-05-25
 
@@ -317,6 +317,56 @@ vLLM startup-command audit, h20-100, vLLM `0.19.0`, NCCL path:
   is the main interpretation difference between `50ms` one-shot pure decode and
   `106ms` sustained service TPOT under the vLLM/NCCL baseline.
 
+vLLM DPLB / CUDA graph bucket audit, same server command:
+
+- Directly pinned DP-rank controls:
+
+| Run | DP-rank distribution | Global output | TPOT p50/p99 | Artifact |
+| --- | --- | ---: | ---: | --- |
+| balanced | `8,8,8,8,8,8,8,8` | `1192.22 tok/s` | `48.41/48.95ms` | `/tmp/kimi-vllm-dp8-dplb-20260525/balanced_8x8/` |
+| one-rank over bucket | `9,8,8,8,8,8,8,7` | `640.94 tok/s` | `96.01/97.34ms` | `/tmp/kimi-vllm-dp8-dplb-20260525/skew_98888887/` |
+| observed-like skew | `8,9,9,9,8,7,7,7` | `612.12 tok/s` | `99.80/99.99ms` | `/tmp/kimi-vllm-dp8-dplb-20260525/skew_89998777/` |
+
+- The old sustained vLLM log showed the same kind of imbalance at bs64:
+  `8,9,9,9,8,7,7,7`, `11,7,7,7,7,8,9,8`, `6,9,9,9,8,8,8,7`,
+  and `10,9,8,7,7,7,7,9`. That is enough to move at least one rank above 8
+  active requests in every slow wave.
+- vLLM DPLB chooses a DP engine by minimizing `waiting * 4 + running` in
+  `/root/develop/xingming/vllm_test/.venv/lib/python3.10/site-packages/vllm/v1/engine/core_client.py`
+  (`get_core_engine_for_request`, lines `1337-1360`). The local load state is
+  periodically overwritten by coordinator stats (`lines 1263-1274`). Under a bursty
+  refill workload this can produce small `9/7` or `11/6` imbalances even when global
+  concurrency is exactly 64.
+- CUDA graph dispatch pads to the next captured size:
+  `/root/develop/xingming/vllm_test/.venv/lib/python3.10/site-packages/vllm/v1/cudagraph_dispatcher.py`
+  maps non-exact sizes to the next capture bucket (`lines 71-90`), then creates the
+  padded descriptor (`lines 140-151`). With capture sizes `[1,2,4,8,16,...]`,
+  local batch `8` runs bucket 8, while local batch `9` runs bucket 16.
+- DP coordination then pads all ranks to the maximum padded token count when CUDA
+  graph is enabled:
+  `/root/develop/xingming/vllm_test/.venv/lib/python3.10/site-packages/vllm/v1/worker/dp_utils.py`
+  says DP padding is enabled for synced CUDA graph mode (`lines 148-160`) and pads
+  every rank to the max (`lines 78-88`). `gpu_model_runner.py` coordinates across DP
+  and re-dispatches with the DP-padded size (`lines 3616-3637`).
+- Therefore the performance cliff is mechanical: if any DP rank receives 9 requests,
+  vLLM pads that rank from 9 to 16, synchronizes the DP group, and every rank runs the
+  bucket-16 graph. That turns a true `8x8` bs64 wave (`~48-50ms`) into a bucket-16
+  wave (`~96-100ms`) even though total concurrency is still 64.
+
+Decision for vLLM interpretation:
+
+- Yes, the vLLM DPLB behavior is the proximate trigger for the surprising 2x TPOT.
+  More precisely, it is a DPLB plus DP CUDA-graph padding cliff. The model and NCCL
+  path can do bs64 in `~50ms` when rank-local batch is exactly `8x8`; sustained
+  refill becomes `~100ms` because the default DPLB does not preserve the graph-bucket
+  boundary.
+- For external vLLM baseline reporting, keep the out-of-box sustained number
+  (`~106ms`) if comparing real serving behavior. For kernel/runtime capability at
+  bs64, also report a pinned-balanced control (`~48-50ms`) and name it as such.
+- A vLLM-side fix would need bucket-aware DP routing for this workload, for example
+  avoiding `rank_local_active > 8` while the global target is bs64, or using an
+  explicit router/header assignment for controlled benchmarks.
+
 Decision:
 
 - Keep. O1 moves prompt_len=1 onto the correct decode shape and clears the current H20
@@ -326,9 +376,9 @@ Decision:
 
 ## Open Questions
 
-- The H20 vLLM TP1 DP8 EP8 sustained bs64 result remains 100ms-class on NCCL/AgRs,
-  while one-shot bs64 is 50ms-class. The remembered 30ms-class TPOT may have been
-  measured on H200, on a one-shot pure-decode wave, or with a different vLLM
+- The H20 vLLM TP1 DP8 EP8 sustained-vs-balanced discrepancy is explained by the
+  DPLB/CUDA-graph bucket cliff above. The remembered 30ms-class TPOT is still not
+  reproduced on H20; it may have been measured on H200 or with a different vLLM
   build/version/runtime flag set.
 - `vllm bench serve` can report `max_concurrent_requests=128` while the command uses
   `--max-concurrency 64`. Source inspection shows the client semaphore is real, but
