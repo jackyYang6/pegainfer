@@ -136,7 +136,7 @@ uv run --no-project python tools/nsys_tail_stats.py \
 
 ### O1 - prompt_len=1 admission goes through decode
 
-Status: keep. Baseline implementation: `8946078`. Safety follow-up: pending commit.
+Status: keep. Baseline implementation: `8946078`. Safety follow-ups: `64192bb`, `0c23389`.
 
 Profile:
 
@@ -174,7 +174,7 @@ Correctness constraints:
 
 Microbench:
 
-- Remote build passed on h20-100.
+- Remote build passed on h20-100 at `0c23389`.
 - Smoke command:
 
 ```bash
@@ -182,11 +182,12 @@ PEGAINFER_KIMI_PARALLEL=tp1dp8 target/release/bench_serving \
   --model-path /data/models/Kimi-K2.5 \
   --cuda-graph false \
   --format json \
-  --out /tmp/kimi-tp1dp8/prompt1_decode_admission_bs64_o5_smoke.json \
+  --out /tmp/kimi-tp1dp8/tp1dp8_bs64_o5_64192bb_smoke.json \
   request --prompt-len 1 --output-len 5 --concurrency 64 --warmup 0 --iters 1
 ```
 
-- Smoke result: `64/64` success, `steady_tpot_ms` p50/p95/p99 `35.81/37.07/37.09ms`, first decode step p50 `38.29ms`.
+- Smoke result after stable-arena safety fix: `64/64` success,
+  `steady_tpot_ms` p50/p95/p99 `37.21/37.41/37.42ms`, first decode step p50 `38.47ms`.
 
 Correctness:
 
@@ -203,7 +204,12 @@ LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
 cargo test -r -p pegainfer-kimi-k2 --features pplx-ep runner::engine::tests --no-fail-fast
 ```
 
-Result: `5 passed`.
+- Local result: `5 passed`.
+- h20-100 result at `0c23389`: `5 passed`.
+- Mixed-arrival service test, `/tmp/kimi-tp1dp8-service/pegainfer_tp1dp8_mixed_arrival_prompt1_o64_0c23389.json`:
+  `64/64` success with `--request-rate 16`, peak concurrent requests `54`, TTFT p50/p99
+  `58.10/110.88ms`, TPOT p50/p99 `35.91/37.63ms`. This covers prompt_len1
+  admissions landing while existing decode slots are active.
 - Old serial-prefill reference rerun from a detached `8431955` worktree was attempted, but the
   temporary worktree initially lacked the FlashInfer third-party include tree. After fixing that,
   the run was stopped because the current task shifted to rechecking vLLM; no serial-reference
@@ -211,13 +217,13 @@ Result: `5 passed`.
 
 Performance:
 
-- In-process, `/tmp/kimi-tp1dp8/prompt1_decode_admission_bs64_o128_w1_i1.json`:
-  `64/64` success, TTFT p50/p99 `73.24/76.42ms`, first decode p50/p99
-  `38.09/38.13ms`, steady TPOT p50/p95/p99 `41.26/43.54/44.15ms`.
+- In-process, `/tmp/kimi-tp1dp8/tp1dp8_bs64_o128_0c23389_w1_i1.json`:
+  `64/64` success, TTFT p50/p99 `74.62/77.19ms`, first decode p50/p99
+  `38.23/38.24ms`, steady TPOT p50/p95/p99 `40.10/43.32/43.72ms`.
 - Service, same `vllm bench serve` client as vLLM,
-  `/tmp/kimi-tp1dp8-service/pegainfer_tp1dp8_bs64_prompt1_decode_admission.json`:
-  `256/256` success, output `1325.58 tok/s`, TTFT p50/p99 `72.11/472.45ms`,
-  TPOT p50/p95/p99 `47.41/47.56/47.56ms`, ITL p50/p99 `47.70/51.55ms`.
+  `/tmp/kimi-tp1dp8-service/pegainfer_tp1dp8_bs64_o128_0c23389_after_warmup.json`:
+  `256/256` success, output `1336.35 tok/s`, TTFT p50/p99 `105.31/127.81ms`,
+  TPOT p50/p95/p99 `47.34/47.70/47.71ms`, ITL p50/p99 `47.84/50.69ms`.
 - vLLM warmup-after baseline,
   `/tmp/kimi-vllm-dp8-warmup-20260525/measure_bs64_o128_after_warmup.json`:
   `256/256` success, output `594.57 tok/s`, TTFT p50/p99 `161.30/303.20ms`,
