@@ -35,12 +35,14 @@ impl KimiRankThreadState {
                         self.sliced_load_plan.rank
                     )
                 })?;
-        weights.typed_view(&self.weight_names).with_context(|| {
-            format!(
-                "failed to validate Kimi rank {} typed GPU weight view",
-                self.sliced_load_plan.rank
-            )
-        })?;
+        weights
+            .validate_typed_view(&self.weight_names)
+            .with_context(|| {
+                format!(
+                    "failed to validate Kimi rank {} typed GPU weight view",
+                    self.sliced_load_plan.rank
+                )
+            })?;
         let tensor_count = weights.tensors.len();
         let total_bytes = weights.total_bytes;
         let expert_kernel_weights = weights
@@ -85,7 +87,6 @@ impl KimiRankThreadState {
             report.expert_kernel_layers
         );
         self.loaded = Some(loaded);
-        self.weight_report = Some(report.clone());
         Ok(report)
     }
 
@@ -152,7 +153,7 @@ impl KimiRankThreadState {
         let loaded = self.loaded.as_mut().ok_or_else(|| {
             anyhow::anyhow!("Kimi rank weights must be loaded before batch decode")
         })?;
-        let tp_comm_ref = self.tp_comm.as_ref().map(|c| c.get());
+        let tp_comm_ref = self.tp_comm.as_ref().map(super::OwnedRankComm::get);
         let device_ctx = self.ctx.as_device_context();
         let decode_aux_ctx = DeviceContext {
             ctx: Arc::clone(&self.decode_aux_ctx.ctx),
@@ -305,7 +306,7 @@ impl KimiRankThreadState {
         let loaded = self.loaded.as_mut().ok_or_else(|| {
             anyhow::anyhow!("Kimi rank weights must be loaded before prompt_len1 batch")
         })?;
-        let tp_comm_ref = self.tp_comm.as_ref().map(|c| c.get());
+        let tp_comm_ref = self.tp_comm.as_ref().map(super::OwnedRankComm::get);
         let device_ctx = self.ctx.as_device_context();
         let KimiRankLoadedWeights {
             gpu,
@@ -460,7 +461,7 @@ impl KimiRankThreadState {
         result
     }
 
-    pub(super) fn forward_prompt_next_token_inner(
+    fn forward_prompt_next_token_inner(
         &mut self,
         slot: usize,
         decode_batch_size: usize,
@@ -475,7 +476,7 @@ impl KimiRankThreadState {
             .loaded
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Kimi rank weights must be loaded before forward"))?;
-        let tp_comm_ref = self.tp_comm.as_ref().map(|c| c.get());
+        let tp_comm_ref = self.tp_comm.as_ref().map(super::OwnedRankComm::get);
         let device_ctx = self.ctx.as_device_context();
         let KimiRankLoadedWeights {
             gpu,

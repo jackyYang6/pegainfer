@@ -4,6 +4,11 @@
 //! text-only config probing. CUDA/runtime bodies land behind these headers.
 
 #![allow(incomplete_features)]
+// `use super::*` is the flat-module-layout idiom for these tightly-coupled
+// submodules (weights.rs + weights/*, runner/worker.rs + worker/*), and the
+// safetensors-mirroring field names (gate_proj, weight_packed, …) read clearer
+// with their shared affix than without. Both are pedantic-only lints.
+#![allow(clippy::wildcard_imports, clippy::struct_field_names)]
 #![feature(generic_const_exprs)]
 
 use std::path::Path;
@@ -13,36 +18,17 @@ use pegainfer_core::engine::{EngineHandle, EngineLoadOptions};
 
 #[cfg(feature = "kimi-k2")]
 pub mod batch_decode_trace;
-#[cfg(feature = "kimi-k2")]
-pub mod collectives;
-pub mod config;
+pub(crate) mod config;
 #[cfg(feature = "kernel-report")]
 pub mod kernel_report;
 #[cfg(feature = "kimi-k2")]
-pub mod layers;
-#[cfg(feature = "kimi-k2")]
 mod runner;
-pub mod tensor;
-pub mod tokenizer;
 #[cfg(feature = "kimi-k2")]
 mod typed_scratch;
 #[cfg(feature = "kimi-k2")]
-pub mod weights;
+mod weights;
 
-pub use config::{KimiK2TextConfig, KimiModelKind, probe_config_json, probe_model};
-#[cfg(feature = "kimi-k2")]
-pub use runner::{KimiK2RankPlacement, KimiK2RunnerConfig};
-#[cfg(feature = "kimi-k2")]
-pub use weights::{
-    KIMI_K2_WEIGHT_INDEX, KimiAttentionGpuWeights, KimiDenseMlpGpuWeights,
-    KimiInt4ProjectionGpuWeights, KimiK2WeightManifest, KimiLayerGpuWeights,
-    KimiLayerKindGpuWeights, KimiMoeLayerGpuWeights, KimiRankGpuContext, KimiRankGpuWeights,
-    KimiRankShardPlan, KimiRankSlicedLoadPlan, KimiRankTypedGpuWeights, KimiRankWeightHeaders,
-    KimiRankWeightNames, KimiRankWeightPlan, KimiRoutedExpertGpuWeights, KimiRouterGpuWeights,
-    KimiShardTensorLoadPlan, KimiSharedExpertGpuWeights, KimiTensorHeader, KimiTensorLoadSlice,
-    KimiTensorLoadSpec, KimiTopGpuWeights, load_rank_sliced_weight_headers,
-    load_rank_sliced_weights_to_gpu, load_rank_weight_headers, load_rank_weights_to_gpu,
-};
+pub use config::{KIMI_K2_LAYERS, probe_config_json};
 
 #[cfg(feature = "kimi-k2")]
 pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<EngineHandle> {

@@ -1,112 +1,48 @@
 //! Kimi-K2.6 text-only constants, config probing, and derived shapes.
 
-use std::path::Path;
-
 use anyhow::{Context, Result, bail, ensure};
-use pegainfer_core::engine::ModelInfo;
 use serde_json::Value;
 
-pub const KIMI_K2_HIDDEN: usize = 7168;
-pub const KIMI_K2_VOCAB: usize = 163_840;
+pub(crate) const KIMI_K2_HIDDEN: usize = 7168;
+pub(crate) const KIMI_K2_VOCAB: usize = 163_840;
 pub const KIMI_K2_LAYERS: usize = 61;
-pub const KIMI_K2_DENSE_LAYERS: usize = 1;
-pub const KIMI_K2_MOE_LAYERS: usize = 60;
-pub const KIMI_K2_MAX_CONTEXT: usize = 262_144;
+pub(crate) const KIMI_K2_DENSE_LAYERS: usize = 1;
+pub(crate) const KIMI_K2_MOE_LAYERS: usize = 60;
+const KIMI_K2_MAX_CONTEXT: usize = 262_144;
 
-pub const KIMI_K2_HEADS: usize = 64;
-pub const KIMI_K2_Q_LORA_RANK: usize = 1536;
-pub const KIMI_K2_KV_LORA_RANK: usize = 512;
-pub const KIMI_K2_QK_NOPE_HEAD_DIM: usize = 128;
-pub const KIMI_K2_QK_ROPE_HEAD_DIM: usize = 64;
-pub const KIMI_K2_Q_HEAD_DIM: usize = KIMI_K2_QK_NOPE_HEAD_DIM + KIMI_K2_QK_ROPE_HEAD_DIM;
-pub const KIMI_K2_V_HEAD_DIM: usize = 128;
-pub const KIMI_K2_Q_PROJ_OUT: usize = KIMI_K2_HEADS * KIMI_K2_Q_HEAD_DIM;
-pub const KIMI_K2_KV_A_OUT: usize = KIMI_K2_KV_LORA_RANK + KIMI_K2_QK_ROPE_HEAD_DIM;
-pub const KIMI_K2_KV_B_OUT: usize = KIMI_K2_HEADS * (KIMI_K2_QK_NOPE_HEAD_DIM + KIMI_K2_V_HEAD_DIM);
-pub const KIMI_K2_O_PROJ_IN: usize = KIMI_K2_HEADS * KIMI_K2_V_HEAD_DIM;
+pub(crate) const KIMI_K2_HEADS: usize = 64;
+pub(crate) const KIMI_K2_Q_LORA_RANK: usize = 1536;
+const KIMI_K2_KV_LORA_RANK: usize = 512;
+pub(crate) const KIMI_K2_QK_NOPE_HEAD_DIM: usize = 128;
+pub(crate) const KIMI_K2_QK_ROPE_HEAD_DIM: usize = 64;
+pub(crate) const KIMI_K2_Q_HEAD_DIM: usize = KIMI_K2_QK_NOPE_HEAD_DIM + KIMI_K2_QK_ROPE_HEAD_DIM;
+pub(crate) const KIMI_K2_V_HEAD_DIM: usize = 128;
 
-pub const KIMI_K2_DENSE_INTERMEDIATE: usize = 18_432;
-pub const KIMI_K2_EXPERT_INTERMEDIATE: usize = 2048;
-pub const KIMI_K2_ROUTED_EXPERTS: usize = 384;
-pub const KIMI_K2_TOPK: usize = 8;
-pub const KIMI_K2_SHARED_EXPERTS: usize = 1;
-pub const KIMI_K2_INT4_GROUP_SIZE: usize = 32;
+pub(crate) const KIMI_K2_DENSE_INTERMEDIATE: usize = 18_432;
+pub(crate) const KIMI_K2_EXPERT_INTERMEDIATE: usize = 2048;
+pub(crate) const KIMI_K2_ROUTED_EXPERTS: usize = 384;
+pub(crate) const KIMI_K2_TOPK: usize = 8;
+const KIMI_K2_SHARED_EXPERTS: usize = 1;
+pub(crate) const KIMI_K2_INT4_GROUP_SIZE: usize = 32;
 
-pub const KIMI_K2_ROPE_THETA: f32 = 50_000.0;
-pub const KIMI_K2_YARN_FACTOR: f32 = 64.0;
-pub const KIMI_K2_YARN_ORIGINAL_MAX_POS: usize = 4096;
-pub const KIMI_K2_YARN_BETA_FAST: f32 = 32.0;
-pub const KIMI_K2_YARN_BETA_SLOW: f32 = 1.0;
-pub const KIMI_K2_ROUTED_SCALING_FACTOR: f32 = 2.827;
-pub const KIMI_K2_RMS_NORM_EPS: f32 = 1.0e-5;
+pub(crate) const KIMI_K2_ROPE_THETA: f32 = 50_000.0;
+pub(crate) const KIMI_K2_YARN_FACTOR: f32 = 64.0;
+pub(crate) const KIMI_K2_YARN_ORIGINAL_MAX_POS: usize = 4096;
+pub(crate) const KIMI_K2_YARN_BETA_FAST: f32 = 32.0;
+pub(crate) const KIMI_K2_YARN_BETA_SLOW: f32 = 1.0;
+const KIMI_K2_ROUTED_SCALING_FACTOR: f32 = 2.827;
+pub(crate) const KIMI_K2_RMS_NORM_EPS: f32 = 1.0e-5;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum KimiModelKind {
-    KimiK25Outer,
-    KimiK2Text,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct KimiK2TextConfig {
-    pub kind: KimiModelKind,
-    pub outer_model_type: String,
-    pub text_model_type: String,
-    pub hidden_size: usize,
-    pub vocab_size: usize,
-    pub num_hidden_layers: usize,
-    pub first_k_dense_replace: usize,
-    pub max_position_embeddings: usize,
-    pub num_attention_heads: usize,
-    pub q_lora_rank: usize,
-    pub kv_lora_rank: usize,
-    pub qk_nope_head_dim: usize,
-    pub qk_rope_head_dim: usize,
-    pub v_head_dim: usize,
-    pub n_routed_experts: usize,
-    pub num_experts_per_tok: usize,
-    pub n_shared_experts: usize,
-    pub moe_intermediate_size: usize,
-    pub dense_intermediate_size: usize,
-    pub routed_scaling_factor: f64,
-    pub rms_norm_eps: f64,
-    pub rope_theta: f64,
-    pub rope_scaling_type: Option<String>,
-    pub quant_method: Option<String>,
-    pub quant_format: Option<String>,
-}
-
-pub fn probe_model(model_path: &Path) -> Result<Option<ModelInfo>> {
-    let config_path = model_path.join("config.json");
-    let content = match std::fs::read_to_string(&config_path) {
-        Ok(content) => content,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err.into()),
-    };
-    let json: Value = serde_json::from_str(&content)
-        .with_context(|| format!("failed to parse {}", config_path.display()))?;
-    let config = match probe_config_json(&json) {
-        Ok(config) => config,
-        Err(_) => return Ok(None),
-    };
-
-    Ok(Some(ModelInfo {
-        id: "kimi-k2.6",
-        display_name: "Kimi-K2.6 text".to_string(),
-        model_path: model_path.to_path_buf(),
-        max_model_len: u32::try_from(config.max_position_embeddings).ok(),
-    }))
-}
-
-pub fn probe_config_json(json: &Value) -> Result<KimiK2TextConfig> {
+/// Validate that `json` is a Kimi-K2.6 text config and that every dimension
+/// matches the constants this crate is compiled against. This is a pure gate:
+/// callers only care whether it succeeds, so nothing is materialized.
+pub fn probe_config_json(json: &Value) -> Result<()> {
     let outer_model_type = string_field(json, "model_type")?;
-    let (kind, text) = if outer_model_type == "kimi_k25" {
-        (
-            KimiModelKind::KimiK25Outer,
-            json.get("text_config")
-                .ok_or_else(|| anyhow::anyhow!("Kimi outer config missing text_config"))?,
-        )
+    let text = if outer_model_type == "kimi_k25" {
+        json.get("text_config")
+            .ok_or_else(|| anyhow::anyhow!("Kimi outer config missing text_config"))?
     } else if outer_model_type == "kimi_k2" {
-        (KimiModelKind::KimiK2Text, json)
+        json
     } else {
         bail!("not a Kimi-K2 config: model_type={outer_model_type}");
     };
@@ -303,33 +239,7 @@ pub fn probe_config_json(json: &Value) -> Result<KimiK2TextConfig> {
         quant_format
     );
 
-    Ok(KimiK2TextConfig {
-        kind,
-        outer_model_type,
-        text_model_type,
-        hidden_size,
-        vocab_size,
-        num_hidden_layers,
-        first_k_dense_replace,
-        max_position_embeddings,
-        num_attention_heads,
-        q_lora_rank,
-        kv_lora_rank,
-        qk_nope_head_dim,
-        qk_rope_head_dim,
-        v_head_dim,
-        n_routed_experts,
-        num_experts_per_tok,
-        n_shared_experts,
-        moe_intermediate_size,
-        dense_intermediate_size,
-        routed_scaling_factor,
-        rms_norm_eps,
-        rope_theta,
-        rope_scaling_type,
-        quant_method,
-        quant_format,
-    })
+    Ok(())
 }
 
 fn string_field(json: &Value, key: &str) -> Result<String> {
@@ -368,45 +278,47 @@ fn ensure_float_close(actual: f64, expected: f64, tolerance: f64, label: &str) -
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct KimiK2ParallelShape {
-    pub tp_world: usize,
-    pub dp_world: usize,
-    pub ep_world: usize,
-    pub heads_per_tp: usize,
-    pub local_experts: usize,
-    pub vocab_per_tp: usize,
+pub(crate) struct KimiK2ParallelShape {
+    pub(crate) tp_world: usize,
+    pub(crate) dp_world: usize,
+    pub(crate) ep_world: usize,
+    pub(crate) heads_per_tp: usize,
+    pub(crate) local_experts: usize,
+    pub(crate) vocab_per_tp: usize,
 }
 
 /// TP-local tensor dimensions derived from `KimiK2ParallelShape`.
 /// All fields scale with `heads_per_tp` or `tp_world`.
 #[derive(Clone, Copy, Debug)]
-pub struct KimiLocalDims {
-    pub local_heads: usize,
-    pub q_proj_out: usize,
-    pub kv_b_out: usize,
-    pub o_proj_in: usize,
-    pub q_nope_out: usize,
-    pub q_pe_out: usize,
-    pub abs_q_out: usize,
-    pub dense_gate_up: usize,
-    pub dense_activated: usize,
-    pub shared_gate_up: usize,
-    pub shared_activated: usize,
+pub(crate) struct KimiLocalDims {
+    pub(crate) local_heads: usize,
+    pub(crate) q_proj_out: usize,
+    pub(crate) kv_b_out: usize,
+    pub(crate) o_proj_in: usize,
+    pub(crate) q_nope_out: usize,
+    pub(crate) q_pe_out: usize,
+    pub(crate) abs_q_out: usize,
+    pub(crate) dense_gate_up: usize,
+    pub(crate) dense_activated: usize,
+    pub(crate) shared_gate_up: usize,
+    pub(crate) shared_activated: usize,
 }
 
 impl KimiK2ParallelShape {
     #[must_use]
-    pub fn tp8_ep8() -> Self {
+    pub(crate) fn tp8_ep8() -> Self {
         Self::new(8, 1)
     }
 
+    // Only the pplx-ep EP backend drives TP1/DP8; gate to match its caller.
+    #[cfg(feature = "pplx-ep")]
     #[must_use]
-    pub fn tp1_dp8() -> Self {
+    pub(crate) fn tp1_dp8() -> Self {
         Self::new(1, 8)
     }
 
     #[must_use]
-    pub fn new(tp_world: usize, dp_world: usize) -> Self {
+    pub(crate) fn new(tp_world: usize, dp_world: usize) -> Self {
         let ep_world = tp_world * dp_world;
         Self {
             tp_world,
@@ -419,7 +331,7 @@ impl KimiK2ParallelShape {
     }
 
     #[must_use]
-    pub fn local_dims(&self) -> KimiLocalDims {
+    pub(crate) fn local_dims(&self) -> KimiLocalDims {
         let h = self.heads_per_tp;
         KimiLocalDims {
             local_heads: h,
@@ -437,7 +349,7 @@ impl KimiK2ParallelShape {
     }
 
     #[must_use]
-    pub fn parallel_config(&self) -> pegainfer_core::parallel::ParallelConfig {
+    pub(crate) fn parallel_config(&self) -> pegainfer_core::parallel::ParallelConfig {
         pegainfer_core::parallel::ParallelConfig::new(self.tp_world, self.dp_world)
     }
 }

@@ -18,10 +18,11 @@ use pegainfer_core::cuda_graph::CudaGraphState;
 use pegainfer_core::ops::call_trace;
 use pegainfer_kernels::{
     ops::{
-        KIMI_K2_MLA_KV_A_OUT, KIMI_K2_MLA_KV_LORA_RANK, KIMI_K2_MLA_Q_HEAD_DIM,
-        KIMI_K2_MLA_QKV_A_OUT, KIMI_K2_MLA_ROPE_DIM, KIMI_K2_MLA_V_HEAD_DIM, KIMI_K2_ROUTER_SCALE,
-        KimiMarlinRouteWorkspace, KimiMarlinWna16Workspace, KimiMlaPagedKvLayout, KimiRouterBatch,
-        KimiRouterConfig, KimiRouterOutput, KimiRouterScratch, flashinfer_topk_row_states_bytes,
+        KIMI_K2_EP_WORLD, KIMI_K2_LOCAL_EXPERTS, KIMI_K2_MLA_KV_A_OUT, KIMI_K2_MLA_KV_LORA_RANK,
+        KIMI_K2_MLA_Q_HEAD_DIM, KIMI_K2_MLA_QKV_A_OUT, KIMI_K2_MLA_ROPE_DIM,
+        KIMI_K2_MLA_V_HEAD_DIM, KIMI_K2_ROUTER_SCALE, KimiMarlinRouteWorkspace,
+        KimiMarlinWna16Workspace, KimiMlaPagedKvLayout, KimiRouterBatch, KimiRouterConfig,
+        KimiRouterOutput, KimiRouterScratch, flashinfer_topk_row_states_bytes,
         kimi_add_f32_bf16_to_bf16, kimi_flashinfer_batch_decode_mla_rt,
         kimi_flashinfer_single_prefill_mla_rt, kimi_marlin_sum_topk_rows_f32,
         kimi_marlin_w13_swiglu, kimi_marlin_wna16_w2_gemm, kimi_marlin_wna16_w13_gemm,
@@ -45,13 +46,12 @@ use crate::{
         KIMI_K2_ROPE_THETA, KIMI_K2_ROUTED_EXPERTS, KIMI_K2_TOPK, KIMI_K2_YARN_BETA_FAST,
         KIMI_K2_YARN_BETA_SLOW, KIMI_K2_YARN_FACTOR, KIMI_K2_YARN_ORIGINAL_MAX_POS,
     },
-    layers::experts::{KIMI_K2_EP_WORLD, KIMI_K2_EP8_LOCAL_EXPERTS},
     runner::affinity::{KimiRankThreadPlacement, pin_rank_worker_thread},
     weights::{
         KimiGpuRawTensor, KimiLayerWeightKindNames, KimiLayerWeightNames,
-        KimiRankExpertMarlinWeights, KimiRankGpuContext, KimiRankGpuWeights, KimiRankShardPlan,
-        KimiRankSlicedLoadPlan, KimiRankWeightNames, KimiRankWeightPlan, KimiRouterDeviceWeights,
-        KimiRouterGpuWeights, load_rank_sliced_weights_to_gpu,
+        KimiRankExpertMarlinWeights, KimiRankGpuContext, KimiRankGpuWeights,
+        KimiRankSlicedLoadPlan, KimiRankWeightNames, KimiRouterDeviceWeights, KimiRouterGpuWeights,
+        load_rank_sliced_weights_to_gpu,
     },
 };
 
@@ -65,13 +65,13 @@ const KIMI_DECODE_PAGES_PER_REQUEST: usize = 128;
 const KIMI_DECODE_ROPE_CACHE_TOKENS: usize = KIMI_DECODE_PAGE_SIZE * KIMI_DECODE_PAGES_PER_REQUEST;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct KimiK2RankPlacement {
+pub(crate) struct KimiK2RankPlacement {
     pub rank: usize,
     pub device_ordinal: usize,
 }
 
 impl KimiK2RankPlacement {
-    pub fn new(rank: usize, device_ordinal: usize) -> Result<Self> {
+    pub(crate) fn new(rank: usize, device_ordinal: usize) -> Result<Self> {
         ensure!(rank < 8, "Kimi-K2 rank must be < 8, got {rank}");
         Ok(Self {
             rank,
@@ -157,9 +157,7 @@ pub(super) struct KimiRankWorker {
 impl KimiRankWorker {
     pub(super) fn spawn(
         placement: KimiK2RankPlacement,
-        weight_plan: KimiRankWeightPlan,
         weight_names: KimiRankWeightNames,
-        shard_plan: KimiRankShardPlan,
         sliced_load_plan: KimiRankSlicedLoadPlan,
         thread_placement: KimiRankThreadPlacement,
         local_dims: crate::config::KimiLocalDims,
@@ -168,52 +166,35 @@ impl KimiRankWorker {
         enable_cuda_graph: bool,
     ) -> Result<Self> {
         ensure!(
-            placement.rank == weight_plan.rank,
-            "Kimi rank placement {} does not match weight plan {}",
-            placement.rank,
-            weight_plan.rank
-        );
-        ensure!(
-            weight_names.rank == weight_plan.rank,
-            "Kimi rank weight names {} do not match weight plan {}",
+            weight_names.rank == placement.rank,
+            "Kimi rank weight names {} do not match placement {}",
             weight_names.rank,
-            weight_plan.rank
+            placement.rank
         );
         ensure!(
-            shard_plan.rank == weight_plan.rank,
-            "Kimi rank shard plan {} does not match weight plan {}",
-            shard_plan.rank,
-            weight_plan.rank
-        );
-        ensure!(
-            sliced_load_plan.rank == weight_plan.rank,
-            "Kimi rank sliced load plan {} does not match weight plan {}",
+            sliced_load_plan.rank == placement.rank,
+            "Kimi rank sliced load plan {} does not match placement {}",
             sliced_load_plan.rank,
-            weight_plan.rank
+            placement.rank
         );
         ensure!(
-            thread_placement.rank == weight_plan.rank,
-            "Kimi rank thread placement {} does not match weight plan {}",
+            thread_placement.rank == placement.rank,
+            "Kimi rank thread placement {} does not match placement {}",
             thread_placement.rank,
-            weight_plan.rank
+            placement.rank
         );
         let (tx, rx) = mpsc::channel();
         let (startup_tx, startup_rx) = mpsc::sync_channel::<Result<()>>(1);
-        let worker_thread_placement = thread_placement.clone();
-        let worker_weight_names = weight_names.clone();
-        let worker_sliced_load_plan = sliced_load_plan.clone();
-        let worker_ctx = ctx.clone();
-        let worker_collective_barrier = Arc::clone(&collective_barrier);
         let handle = thread::Builder::new()
             .name(format!("kimi-k2-rank-{}", placement.rank))
             .spawn(move || {
-                pin_rank_worker_thread(&worker_thread_placement);
+                pin_rank_worker_thread(&thread_placement);
                 match bind_rank_thread(
-                    worker_ctx,
-                    worker_weight_names,
-                    worker_sliced_load_plan,
+                    ctx,
+                    weight_names,
+                    sliced_load_plan,
                     local_dims,
-                    worker_collective_barrier,
+                    collective_barrier,
                     enable_cuda_graph,
                 ) {
                     Ok(state) => {
@@ -388,7 +369,6 @@ struct KimiRankThreadState {
     local_dims: crate::config::KimiLocalDims,
     collective_barrier: Arc<Barrier>,
     enable_cuda_graph: bool,
-    weight_report: Option<KimiRankWeightLoadReport>,
     loaded: Option<KimiRankLoadedWeights>,
     #[cfg(feature = "pplx-ep")]
     ep_backend: Option<pegainfer_comm::EpBackend>,
@@ -594,7 +574,6 @@ fn bind_rank_thread(
         local_dims,
         collective_barrier,
         enable_cuda_graph,
-        weight_report: None,
         loaded: None,
         #[cfg(feature = "pplx-ep")]
         ep_backend: None,
@@ -603,6 +582,10 @@ fn bind_rank_thread(
     })
 }
 
+// The worker owns its command channel for the lifetime of the loop: taking
+// `&Receiver` would leave the channel alive in the caller and break the
+// "senders dropped → loop exits" shutdown signal.
+#[allow(clippy::needless_pass_by_value)]
 fn rank_worker_loop(rx: Receiver<KimiRankCommand>, mut state: KimiRankThreadState) {
     while let Ok(cmd) = rx.recv() {
         match cmd {

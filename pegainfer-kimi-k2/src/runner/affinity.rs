@@ -1,9 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, ensure};
 use pegainfer_core::cpu_topology::{
     CpuId, RankCpuSlice, RankNumaNode, cuda_device_numa_node, current_allowed_cpus,
-    format_cpu_list, pin_current_thread_to_cpu, read_numa_cpu_pool, split_rank_cpu_slices,
+    pin_current_thread_to_cpu, read_numa_cpu_pool, split_rank_cpu_slices,
 };
 
 const SYSTEM_RESERVED_CPU: usize = 0;
@@ -12,16 +12,7 @@ const SCHEDULER_CPU: usize = 1;
 #[derive(Clone, Debug)]
 pub(super) struct KimiRankThreadPlacement {
     pub(super) rank: usize,
-    pub(super) device_ordinal: usize,
-    pub(super) numa_node: usize,
-    pub(super) cpu_slice: Vec<CpuId>,
     pub(super) rank_worker_cpu: CpuId,
-}
-
-impl KimiRankThreadPlacement {
-    pub(super) fn cpu_slice_display(&self) -> String {
-        format_cpu_list(&self.cpu_slice)
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -37,17 +28,17 @@ impl KimiRankThreadPlacementPlan {
         let reserved_cpus = [CpuId::new(SYSTEM_RESERVED_CPU)?, CpuId::new(SCHEDULER_CPU)?];
 
         let mut rank_nodes = Vec::with_capacity(devices.len());
-        let mut numa_nodes = BTreeMap::new();
+        let mut numa_nodes = BTreeSet::new();
         for (rank, &device_ordinal) in devices.iter().enumerate() {
             let numa_node = cuda_device_numa_node(device_ordinal).with_context(|| {
                 format!("read NUMA node for Kimi rank {rank} cuda:{device_ordinal}")
             })?;
             rank_nodes.push(RankNumaNode { rank, numa_node });
-            numa_nodes.insert(numa_node, ());
+            numa_nodes.insert(numa_node);
         }
 
         let pools = numa_nodes
-            .keys()
+            .iter()
             .map(|&node| read_numa_cpu_pool(node))
             .collect::<Result<Vec<_>>>()?;
         let slices = split_rank_cpu_slices(&pools, &rank_nodes, &allowed_cpus, &reserved_cpus)?;
@@ -59,12 +50,12 @@ impl KimiRankThreadPlacementPlan {
         );
 
         let mut ranks = Vec::with_capacity(devices.len());
-        for (rank, &device_ordinal) in devices.iter().enumerate() {
+        for rank in 0..devices.len() {
             let slice = slices
                 .iter()
                 .find(|slice| slice.rank == rank)
                 .with_context(|| format!("missing Kimi CPU slice for rank {rank}"))?;
-            ranks.push(rank_thread_placement(device_ordinal, slice)?);
+            ranks.push(rank_thread_placement(slice)?);
         }
         Ok(Self {
             scheduler_cpu,
@@ -72,7 +63,7 @@ impl KimiRankThreadPlacementPlan {
         })
     }
 
-    pub(super) fn scheduler_cpu(&self) -> Option<CpuId> {
+    fn scheduler_cpu(&self) -> Option<CpuId> {
         self.scheduler_cpu
     }
 
@@ -84,19 +75,13 @@ impl KimiRankThreadPlacementPlan {
     }
 }
 
-fn rank_thread_placement(
-    device_ordinal: usize,
-    slice: &RankCpuSlice,
-) -> Result<KimiRankThreadPlacement> {
+fn rank_thread_placement(slice: &RankCpuSlice) -> Result<KimiRankThreadPlacement> {
     let rank_worker_cpu = *slice
         .cpus
         .first()
         .with_context(|| format!("Kimi rank {} has empty CPU slice", slice.rank))?;
     Ok(KimiRankThreadPlacement {
         rank: slice.rank,
-        device_ordinal,
-        numa_node: slice.numa_node,
-        cpu_slice: slice.cpus.clone(),
         rank_worker_cpu,
     })
 }
@@ -116,11 +101,6 @@ pub(super) fn pin_rank_worker_thread(placement: &KimiRankThreadPlacement) {
             placement.rank, placement.rank_worker_cpu
         )
     });
-    let _ = (
-        placement.device_ordinal,
-        placement.numa_node,
-        placement.cpu_slice_display(),
-    );
 }
 
 fn scheduler_cpu() -> Result<Option<CpuId>> {

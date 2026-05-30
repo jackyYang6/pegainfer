@@ -1,18 +1,18 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use pegainfer_bench::{Accum, CallSiteRow, RollupRow, accumulate, call_site_row, rollup_row};
+use pegainfer_kernels::ops::KIMI_K2_EP_WORLD;
 use pegainfer_kernels::tensor::KernelCall;
+use pegainfer_kimi_k2::KIMI_K2_LAYERS;
 use pegainfer_kimi_k2::batch_decode_trace::{
     MODEL, PHASE_DECODE, TP_WORLD_SIZE, normalize_call_site, trace_decode_kernel_calls,
     trace_runtime_decode_kernel_calls,
 };
-use pegainfer_kimi_k2::config::KIMI_K2_LAYERS;
 use pegainfer_kimi_k2::kernel_report::{LatencyStats, MeasuredCall, bench_key, measure_call};
-use pegainfer_kimi_k2::layers::experts::KIMI_K2_EP_WORLD;
 use serde::Serialize;
 
 const DEFAULT_ITERS: u64 = 16;
@@ -101,7 +101,7 @@ struct BenchEntry {
 #[derive(Default)]
 struct MissingAccum {
     calls: usize,
-    call_sites: BTreeMap<String, ()>,
+    call_sites: BTreeSet<String>,
     reason: Option<String>,
 }
 
@@ -176,46 +176,43 @@ fn compose_report(
             .ok_or_else(|| anyhow::anyhow!("missing measured catalog entry for {}", call.label))?;
         let site = normalize_call_site(&call.label);
         let cov_key = format!("{site}::{}", call.op);
-        match &entry.measured.stats {
-            Some(stats) => {
-                accumulate(by_op.entry(call.op.clone()).or_default(), stats);
-                let (_, site_accum) = by_site
-                    .entry(site.clone())
-                    .or_insert_with(|| (call.op.clone(), Accum::default()));
-                accumulate(site_accum, stats);
-                coverage
-                    .entry(cov_key)
-                    .or_insert_with(|| CoverageRow {
-                        call_site: site,
-                        op: call.op.clone(),
-                        status: "measured".to_string(),
-                        calls: 0,
-                        latency: Some(stats.clone()),
-                        key: Some(entry.key.clone()),
-                        reason: None,
-                    })
-                    .calls += 1;
+        if let Some(stats) = &entry.measured.stats {
+            accumulate(by_op.entry(call.op.clone()).or_default(), stats);
+            let (_, site_accum) = by_site
+                .entry(site.clone())
+                .or_insert_with(|| (call.op.clone(), Accum::default()));
+            accumulate(site_accum, stats);
+            coverage
+                .entry(cov_key)
+                .or_insert_with(|| CoverageRow {
+                    call_site: site,
+                    op: call.op.clone(),
+                    status: "measured".to_string(),
+                    calls: 0,
+                    latency: Some(stats.clone()),
+                    key: Some(entry.key.clone()),
+                    reason: None,
+                })
+                .calls += 1;
+        } else {
+            let missing = missing_by_op.entry(call.op.clone()).or_default();
+            missing.calls += 1;
+            missing.call_sites.insert(site.clone());
+            if missing.reason.is_none() {
+                missing.reason.clone_from(&entry.measured.reason);
             }
-            None => {
-                let missing = missing_by_op.entry(call.op.clone()).or_default();
-                missing.calls += 1;
-                missing.call_sites.insert(site.clone(), ());
-                if missing.reason.is_none() {
-                    missing.reason = entry.measured.reason.clone();
-                }
-                coverage
-                    .entry(cov_key)
-                    .or_insert_with(|| CoverageRow {
-                        call_site: site,
-                        op: call.op.clone(),
-                        status: "missing_provider".to_string(),
-                        calls: 0,
-                        latency: None,
-                        key: Some(entry.key.clone()),
-                        reason: entry.measured.reason.clone(),
-                    })
-                    .calls += 1;
-            }
+            coverage
+                .entry(cov_key)
+                .or_insert_with(|| CoverageRow {
+                    call_site: site,
+                    op: call.op.clone(),
+                    status: "missing_provider".to_string(),
+                    calls: 0,
+                    latency: None,
+                    key: Some(entry.key.clone()),
+                    reason: entry.measured.reason.clone(),
+                })
+                .calls += 1;
         }
     }
 
