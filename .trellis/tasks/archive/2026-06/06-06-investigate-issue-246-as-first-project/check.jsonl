@@ -1,0 +1,2 @@
+{"file":".trellis/spec/guides/index.md","reason":"Shared quality/check thinking rules for avoiding missed edge cases and unnecessary abstraction."}
+{"file":".trellis/tasks/06-06-investigate-issue-246-as-first-project/research/issue-247.md","reason":"Check implementation against #247 acceptance: CPU-only evict-then-rematch behavioral test and validation commands."}
