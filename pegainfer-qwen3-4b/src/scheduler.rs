@@ -11,6 +11,7 @@ mod resolve;
 
 use std::collections::{HashSet, VecDeque};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use log::{info, warn};
@@ -24,7 +25,7 @@ use pegainfer_core::engine::{
 };
 use pegainfer_core::sampler::SamplingParams;
 
-use self::effects::apply_effects;
+use self::effects::{PrefixCacheStats, apply_effects};
 use self::plan::{build_next_plan, execute_plan};
 use self::resolve::resolve_step;
 
@@ -47,6 +48,8 @@ pub(super) struct ActiveRequestState {
 pub(super) struct PendingRequest {
     pub(super) request_id: RequestId,
     pub(super) lora_adapter: Option<String>,
+    pub(super) queued_at_unix_s: Option<f64>,
+    pub(super) scheduled_at_unix_s: Option<f64>,
     pub(super) prompt_tokens: Vec<u32>,
     pub(super) params: SamplingParams,
     pub(super) max_tokens: usize,
@@ -60,6 +63,8 @@ impl PendingRequest {
         Self {
             request_id,
             lora_adapter: req.lora_adapter,
+            queued_at_unix_s: req.queued_at_unix_s,
+            scheduled_at_unix_s: None,
             prompt_tokens: req.prompt_tokens,
             params: req.params,
             max_tokens: req.max_tokens,
@@ -136,6 +141,7 @@ fn scheduler_loop<E>(
     let mut rng = StdRng::seed_from_u64(seed);
     let mut active: Vec<ActiveRequestState> = Vec::new();
     let mut next_request_id = 0u64;
+    let mut prefix_cache_stats = PrefixCacheStats::default();
     // Requests that could not be admitted due to KV budget pressure.
     // Held here so they aren't lost; re-evaluated every loop iteration.
     let mut deferred: Vec<PendingRequest> = Vec::new();
@@ -204,7 +210,7 @@ fn scheduler_loop<E>(
             }
         };
         let effects = resolve_step(&executor, &active, artifacts);
-        apply_effects(&mut executor, &mut active, effects);
+        apply_effects(&mut executor, &mut active, effects, &mut prefix_cache_stats);
     }
 }
 
@@ -218,6 +224,7 @@ fn scheduler_loop_with_lora_control<E>(
     let mut rng = StdRng::seed_from_u64(seed);
     let mut active: Vec<ActiveRequestState> = Vec::new();
     let mut next_request_id = 0u64;
+    let mut prefix_cache_stats = PrefixCacheStats::default();
     let mut deferred: Vec<PendingRequest> = Vec::new();
     let mut pending_control: VecDeque<EngineControlRequest> = VecDeque::new();
     let mut post_control_deferred: Vec<PendingRequest> = Vec::new();
@@ -325,7 +332,7 @@ fn scheduler_loop_with_lora_control<E>(
             }
         };
         let effects = resolve_step(&executor, &active, artifacts);
-        apply_effects(&mut executor, &mut active, effects);
+        apply_effects(&mut executor, &mut active, effects, &mut prefix_cache_stats);
     }
 }
 
@@ -531,6 +538,13 @@ fn send_unknown_lora_rejection(req: &PendingRequest) {
     });
 }
 
+fn now_secs_f64() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_secs_f64()
+}
+
 fn failure_targets_for(
     active: &[ActiveRequestState],
     plan: &self::plan::ExecutionPlan,
@@ -615,6 +629,7 @@ mod tests {
         held_tokens: HashMap<RequestId, usize>,
         fail_decode_once: bool,
         decode_delay: Duration,
+        cached_tokens: usize,
         loaded_lora_adapters: HashSet<String>,
         active_lora_adapter: Option<String>,
         lora_activations: Arc<Mutex<Vec<Option<String>>>>,
@@ -632,6 +647,7 @@ mod tests {
                 held_tokens: HashMap::new(),
                 fail_decode_once: false,
                 decode_delay: Duration::ZERO,
+                cached_tokens: 0,
                 loaded_lora_adapters: HashSet::new(),
                 active_lora_adapter: None,
                 lora_activations: Arc::new(Mutex::new(Vec::new())),
@@ -648,6 +664,11 @@ mod tests {
 
         fn with_decode_delay(mut self, delay: Duration) -> Self {
             self.decode_delay = delay;
+            self
+        }
+
+        fn with_cached_tokens(mut self, cached_tokens: usize) -> Self {
+            self.cached_tokens = cached_tokens;
             self
         }
 
@@ -765,7 +786,7 @@ mod tests {
                         first_token: 100 + req.request_id.get() as u32,
                         first_token_logprob: None,
                         prompt_logprobs: None,
-                        cached_tokens: 0,
+                        cached_tokens: self.cached_tokens,
                     })
                     .collect(),
             })
@@ -845,7 +866,7 @@ mod tests {
                         first_token: 100 + req.request_id.get() as u32,
                         first_token_logprob: None,
                         prompt_logprobs: None,
-                        cached_tokens: 0,
+                        cached_tokens: self.cached_tokens,
                     })
                     .collect(),
                 decode_requests: plan
@@ -958,11 +979,21 @@ mod tests {
         let (fits_exactly, mut rx) = request(16, 1);
         handle.submit(fits_exactly).expect("submit fits_exactly");
         assert!(
-            matches!(rx.blocking_recv(), Some(TokenEvent::Token { id: 100, .. })),
+            matches!(rx.blocking_recv(), Some(TokenEvent::Scheduled { .. })),
+            "prefill should emit the scheduled event first"
+        );
+        assert!(
+            matches!(
+                next_non_scheduled(&mut rx),
+                Some(TokenEvent::Token { id: 100, .. })
+            ),
             "prefill should emit the sampled token"
         );
         assert!(
-            matches!(rx.blocking_recv(), Some(TokenEvent::Finished { .. })),
+            matches!(
+                next_non_scheduled(&mut rx),
+                Some(TokenEvent::Finished { .. })
+            ),
             "one-token completion should finish without a decode KV page"
         );
         assert!(
@@ -980,8 +1011,12 @@ mod tests {
         let (long_running, mut long_rx) = request(16, 18);
         handle.submit(long_running).expect("submit long_running");
         assert!(
+            matches!(long_rx.blocking_recv(), Some(TokenEvent::Scheduled { .. })),
+            "first request should report scheduling"
+        );
+        assert!(
             matches!(
-                long_rx.blocking_recv(),
+                next_non_scheduled(&mut long_rx),
                 Some(TokenEvent::Token { id: 100, .. })
             ),
             "first request should prefill"
@@ -991,8 +1026,12 @@ mod tests {
         handle.submit(must_wait).expect("submit must_wait");
 
         assert!(
+            matches!(wait_rx.blocking_recv(), Some(TokenEvent::Scheduled { .. })),
+            "waiting request should report scheduling"
+        );
+        assert!(
             matches!(
-                wait_rx.blocking_recv(),
+                next_non_scheduled(&mut wait_rx),
                 Some(TokenEvent::Token { id: 101, .. })
             ),
             "waiting request should start once the active request releases its full KV budget"
@@ -1002,7 +1041,10 @@ mod tests {
             "second request was admitted before the first request released KV"
         );
         assert!(
-            matches!(wait_rx.blocking_recv(), Some(TokenEvent::Finished { .. })),
+            matches!(
+                next_non_scheduled(&mut wait_rx),
+                Some(TokenEvent::Finished { .. })
+            ),
             "waiting request should finish after admission"
         );
     }
@@ -1038,6 +1080,34 @@ mod tests {
         (request, token_rx)
     }
 
+    fn request_with_queue_time(
+        prompt_len: usize,
+        max_tokens: usize,
+        queued_at_unix_s: f64,
+    ) -> (GenerateRequest, mpsc::UnboundedReceiver<TokenEvent>) {
+        let (mut request, token_rx) = request(prompt_len, max_tokens);
+        request.queued_at_unix_s = Some(queued_at_unix_s);
+        (request, token_rx)
+    }
+
+    fn echo_request(
+        prompt_len: usize,
+        max_tokens: usize,
+    ) -> (GenerateRequest, mpsc::UnboundedReceiver<TokenEvent>) {
+        let (mut request, token_rx) = request(prompt_len, max_tokens);
+        request.echo = true;
+        (request, token_rx)
+    }
+
+    fn next_non_scheduled(rx: &mut mpsc::UnboundedReceiver<TokenEvent>) -> Option<TokenEvent> {
+        loop {
+            match rx.blocking_recv() {
+                Some(TokenEvent::Scheduled { .. }) => continue,
+                other => return other,
+            }
+        }
+    }
+
     fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
         let start = Instant::now();
         while start.elapsed() < timeout {
@@ -1050,6 +1120,147 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_event_preserves_cached_tokens_and_order() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let executor = FakeExecutor::new(4, Arc::clone(&dropped)).with_cached_tokens(12);
+        let handle = start_with_executor(executor, 42);
+
+        let queued_at = 1234.5;
+        let (request, mut rx) = request_with_queue_time(16, 1, queued_at);
+        handle.submit(request).expect("submit cached request");
+
+        match rx.blocking_recv() {
+            Some(TokenEvent::Scheduled {
+                queued_at_unix_s,
+                scheduled_at_unix_s,
+                prompt_tokens,
+                cached_tokens,
+            }) => {
+                assert_eq!(queued_at_unix_s, queued_at);
+                assert!(scheduled_at_unix_s >= queued_at);
+                assert_eq!(prompt_tokens, 16);
+                assert_eq!(cached_tokens, 12);
+            }
+            _ => panic!("expected Scheduled before token/finish"),
+        }
+        assert!(
+            matches!(
+                next_non_scheduled(&mut rx),
+                Some(TokenEvent::Token { id: 100, .. })
+            ),
+            "token should follow Scheduled"
+        );
+        assert!(
+            matches!(
+                next_non_scheduled(&mut rx),
+                Some(TokenEvent::Finished { .. })
+            ),
+            "finish should follow token"
+        );
+    }
+
+    #[test]
+    fn scheduled_event_queue_time_falls_back_to_scheduled_time() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let executor = FakeExecutor::new(4, Arc::clone(&dropped));
+        let handle = start_with_executor(executor, 42);
+
+        let (request, mut rx) = request(16, 1);
+        handle.submit(request).expect("submit request");
+
+        match rx.blocking_recv() {
+            Some(TokenEvent::Scheduled {
+                queued_at_unix_s,
+                scheduled_at_unix_s,
+                cached_tokens,
+                ..
+            }) => {
+                assert_eq!(queued_at_unix_s, scheduled_at_unix_s);
+                assert_eq!(cached_tokens, 0);
+            }
+            _ => panic!("expected Scheduled before token/finish"),
+        }
+    }
+
+    #[test]
+    fn echo_request_emits_scheduled_before_prompt_tokens() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let executor = FakeExecutor::new(4, Arc::clone(&dropped)).with_cached_tokens(8);
+        let handle = start_with_executor(executor, 42);
+
+        let (request, mut rx) = echo_request(16, 1);
+        handle.submit(request).expect("submit echo request");
+
+        match rx.blocking_recv() {
+            Some(TokenEvent::Scheduled {
+                prompt_tokens,
+                cached_tokens,
+                ..
+            }) => {
+                assert_eq!(prompt_tokens, 16);
+                assert_eq!(cached_tokens, 8);
+            }
+            _ => panic!("expected Scheduled before prompt echo"),
+        }
+        match rx.blocking_recv() {
+            Some(TokenEvent::PromptTokens { ids, logprobs }) => {
+                assert_eq!(ids, vec![1; 16]);
+                assert_eq!(logprobs, vec![None; 16]);
+            }
+            _ => panic!("expected PromptTokens after Scheduled"),
+        }
+        assert!(
+            matches!(rx.blocking_recv(), Some(TokenEvent::Token { id: 100, .. })),
+            "sampled token should follow prompt echo"
+        );
+        assert!(
+            matches!(rx.blocking_recv(), Some(TokenEvent::Finished { .. })),
+            "one-token echo request should finish after token"
+        );
+    }
+
+    #[test]
+    fn prefix_cache_stats_accumulate_cumulative_engine_totals() {
+        let mut stats = PrefixCacheStats::default();
+
+        stats.observe(effects::ScheduledEffect {
+            queued_at_unix_s: 1.0,
+            scheduled_at_unix_s: 2.0,
+            prompt_tokens: 16,
+            cached_tokens: 0,
+        });
+        stats.observe(effects::ScheduledEffect {
+            queued_at_unix_s: 3.0,
+            scheduled_at_unix_s: 4.0,
+            prompt_tokens: 16,
+            cached_tokens: 12,
+        });
+        stats.observe(effects::ScheduledEffect {
+            queued_at_unix_s: 5.0,
+            scheduled_at_unix_s: 6.0,
+            prompt_tokens: 8,
+            cached_tokens: 0,
+        });
+
+        let (
+            total_requests,
+            hit_requests,
+            miss_requests,
+            hit_rate,
+            total_prompt_tokens,
+            total_cached_tokens,
+            token_hit_rate,
+        ) = stats.totals();
+        assert_eq!(total_requests, 3);
+        assert_eq!(hit_requests, 1);
+        assert_eq!(miss_requests, 2);
+        assert!((hit_rate - (1.0 / 3.0)).abs() < f64::EPSILON);
+        assert_eq!(total_prompt_tokens, 40);
+        assert_eq!(total_cached_tokens, 12);
+        assert!((token_hit_rate - 0.3).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn impossible_request_is_rejected_without_blocking_later_work() {
         let dropped = Arc::new(Mutex::new(Vec::new()));
         let executor = FakeExecutor::new(2, Arc::clone(&dropped));
@@ -1057,7 +1268,7 @@ mod tests {
 
         let (too_large, mut too_large_rx) = request(16, 34);
         handle.submit(too_large).expect("submit too_large");
-        match too_large_rx.blocking_recv() {
+        match next_non_scheduled(&mut too_large_rx) {
             Some(TokenEvent::Rejected {
                 prompt_tokens,
                 completion_tokens,
@@ -1072,12 +1283,19 @@ mod tests {
 
         let (fits, mut fits_rx) = request(16, 1);
         handle.submit(fits).expect("submit fits");
-        match fits_rx.blocking_recv() {
+        assert!(
+            matches!(fits_rx.blocking_recv(), Some(TokenEvent::Scheduled { .. })),
+            "later fitting request should report scheduling"
+        );
+        match next_non_scheduled(&mut fits_rx) {
             Some(TokenEvent::Token { id, .. }) => assert_eq!(id, 101),
             _ => panic!("later fitting request should emit a token"),
         }
         assert!(
-            matches!(fits_rx.blocking_recv(), Some(TokenEvent::Finished { .. })),
+            matches!(
+                next_non_scheduled(&mut fits_rx),
+                Some(TokenEvent::Finished { .. })
+            ),
             "later fitting request should finish"
         );
     }
@@ -1152,7 +1370,7 @@ mod tests {
         handle.submit(unknown).expect("submit unknown adapter");
         handle.submit(base).expect("submit base");
 
-        match unknown_rx.blocking_recv() {
+        match next_non_scheduled(&mut unknown_rx) {
             Some(TokenEvent::Rejected {
                 message,
                 prompt_tokens,
@@ -1166,14 +1384,21 @@ mod tests {
         }
 
         assert!(
+            matches!(base_rx.blocking_recv(), Some(TokenEvent::Scheduled { .. })),
+            "base request should report scheduling"
+        );
+        assert!(
             matches!(
-                base_rx.blocking_recv(),
+                next_non_scheduled(&mut base_rx),
                 Some(TokenEvent::Token { id: 101, .. })
             ),
             "base request should still run after unknown adapter rejection"
         );
         assert!(
-            matches!(base_rx.blocking_recv(), Some(TokenEvent::Finished { .. })),
+            matches!(
+                next_non_scheduled(&mut base_rx),
+                Some(TokenEvent::Finished { .. })
+            ),
             "base request should finish"
         );
     }
@@ -1187,13 +1412,17 @@ mod tests {
         let (will_fail, mut fail_rx) = request(16, 2);
         handle.submit(will_fail).expect("submit will_fail");
         assert!(
+            matches!(fail_rx.blocking_recv(), Some(TokenEvent::Scheduled { .. })),
+            "scheduled event should be emitted before first token"
+        );
+        assert!(
             matches!(
-                fail_rx.blocking_recv(),
+                next_non_scheduled(&mut fail_rx),
                 Some(TokenEvent::Token { id: 100, .. })
             ),
             "first token should be emitted before decode failure"
         );
-        match fail_rx.blocking_recv() {
+        match next_non_scheduled(&mut fail_rx) {
             Some(TokenEvent::Error {
                 message,
                 prompt_tokens,
@@ -1216,14 +1445,21 @@ mod tests {
         let (after_failure, mut after_rx) = request(16, 1);
         handle.submit(after_failure).expect("submit after_failure");
         assert!(
+            matches!(after_rx.blocking_recv(), Some(TokenEvent::Scheduled { .. })),
+            "request after failure should report scheduling"
+        );
+        assert!(
             matches!(
-                after_rx.blocking_recv(),
+                next_non_scheduled(&mut after_rx),
                 Some(TokenEvent::Token { id: 101, .. })
             ),
             "scheduler should accept new work after a decode error"
         );
         assert!(
-            matches!(after_rx.blocking_recv(), Some(TokenEvent::Finished { .. })),
+            matches!(
+                next_non_scheduled(&mut after_rx),
+                Some(TokenEvent::Finished { .. })
+            ),
             "request after failure should finish"
         );
     }
@@ -1239,8 +1475,12 @@ mod tests {
             .submit(will_disconnect)
             .expect("submit will_disconnect");
         assert!(
+            matches!(token_rx.blocking_recv(), Some(TokenEvent::Scheduled { .. })),
+            "prefill should report scheduling"
+        );
+        assert!(
             matches!(
-                token_rx.blocking_recv(),
+                next_non_scheduled(&mut token_rx),
                 Some(TokenEvent::Token { id: 100, .. })
             ),
             "prefill should emit the first token"
@@ -1280,11 +1520,11 @@ mod tests {
                 .expect("seed fake request state");
         }
 
+        let mut prefix_cache_stats = PrefixCacheStats::default();
         apply_effects(
             &mut executor,
             &mut active,
             effects::StepEffects {
-                prompt_echoes: Vec::new(),
                 pending: Vec::new(),
                 decode: vec![
                     effects::DecodeEffect::EmitAndFinish {
@@ -1310,6 +1550,7 @@ mod tests {
                     },
                 ],
             },
+            &mut prefix_cache_stats,
         );
 
         assert!(
@@ -1380,8 +1621,12 @@ mod tests {
         let (long_running, mut token_rx) = request(16, 3);
         handle.submit(long_running).expect("submit long_running");
         assert!(
+            matches!(token_rx.blocking_recv(), Some(TokenEvent::Scheduled { .. })),
+            "scheduled event should be emitted before first token"
+        );
+        assert!(
             matches!(
-                token_rx.blocking_recv(),
+                next_non_scheduled(&mut token_rx),
                 Some(TokenEvent::Token { id: 100, .. })
             ),
             "first token should be emitted before decode"
@@ -1409,7 +1654,10 @@ mod tests {
             "load_lora_adapter should wait while generation is active"
         );
 
-        while !matches!(token_rx.blocking_recv(), Some(TokenEvent::Finished { .. })) {}
+        while !matches!(
+            next_non_scheduled(&mut token_rx),
+            Some(TokenEvent::Finished { .. })
+        ) {}
 
         let error = load_thread
             .join()

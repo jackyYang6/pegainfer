@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -39,6 +40,9 @@ use zeromq::prelude::{Socket, SocketRecv, SocketSend};
 use zeromq::util::PeerIdentity;
 use zeromq::{DealerSocket, PushSocket, SocketOptions, ZmqMessage};
 
+mod patch_usage;
+
+use patch_usage::{CachedTokenUsageMap, cached_token_usage_routes, external_request_id};
 use pegainfer_engine::engine::{
     EngineControlError, EngineHandle, FinishReason, GenerateRequest, LoadLoraAdapterRequest,
     TokenEvent, TokenLogprob, UnloadLoraAdapterRequest,
@@ -48,6 +52,8 @@ use pegainfer_engine::sampler::SamplingParams;
 const ENGINE_INDEX: u32 = 0;
 const LORA_ROUTE_BODY_LIMIT: usize = 128 * 1024 * 1024;
 const LORA_ADAPTER_XARG: &str = "pegainfer_lora_adapter";
+static CACHED_TOKENS_BY_REQUEST_ID: LazyLock<CachedTokenUsageMap> =
+    LazyLock::new(|| Arc::new(RwLock::new(HashMap::new())));
 
 #[derive(Clone)]
 struct LoraRouteState {
@@ -424,8 +430,17 @@ impl LocalEngineBridge {
         let output_tx = output_tx.clone();
         let done_tx = done_tx.clone();
         let task_request_id = request_id.clone();
+        let usage_request_id = external_request_id(&request_id);
+        let cached_tokens_by_request_id = CACHED_TOKENS_BY_REQUEST_ID.clone();
         let task = tokio::spawn(async move {
-            run_request_stream(task_request_id.clone(), token_rx, output_tx).await;
+            run_request_stream(
+                task_request_id.clone(),
+                usage_request_id,
+                token_rx,
+                output_tx,
+                cached_tokens_by_request_id,
+            )
+            .await;
             let _ = done_tx.send(task_request_id);
         });
         active.insert(request_id, task);
@@ -447,7 +462,7 @@ pub async fn serve(
         model_path.to_string_lossy().into_owned(),
         served_model_name
             .into_iter()
-            .map(|name| name.to_string())
+            .map(std::string::ToString::to_string)
             .collect(),
         port,
         max_model_len,
@@ -502,14 +517,18 @@ pub async fn serve_model_with_lora_routes(
         max_model_len,
         shutdown,
         move |router| {
+            let patched_router =
+                cached_token_usage_routes(router, CACHED_TOKENS_BY_REQUEST_ID.clone());
             let lora_router = lora_routes(handle.clone(), Arc::clone(&adapter_names));
             let openai_router = lora_openai_routes(
-                router.clone(),
+                patched_router.clone(),
                 base_model_name,
                 served_model_name,
                 Arc::clone(&adapter_names),
             );
-            openai_router.merge(lora_router).fallback_service(router)
+            openai_router
+                .merge(lora_router)
+                .fallback_service(patched_router)
         },
     )
     .await
@@ -557,7 +576,7 @@ async fn serve_model_on_host(
         port,
         max_model_len,
         shutdown,
-        |router| router,
+        |router| cached_token_usage_routes(router, CACHED_TOKENS_BY_REQUEST_ID.clone()),
     )
     .await
 }
@@ -738,8 +757,10 @@ async fn lora_models_response(
 
 async fn run_request_stream(
     request_id: String,
+    usage_request_id: String,
     mut token_rx: mpsc::UnboundedReceiver<TokenEvent>,
     output_tx: mpsc::UnboundedSender<EngineCoreOutputs>,
+    cached_tokens_by_request_id: Arc<RwLock<HashMap<String, u32>>>,
 ) {
     let mut first_token_events = None;
     let mut first_token_prefill_stats = None;
@@ -758,6 +779,7 @@ async fn run_request_stream(
                 queued_at_unix_s,
                 scheduled_at_unix_s,
                 prompt_tokens,
+                cached_tokens,
             } => {
                 first_token_events = Some(vec![
                     EngineCoreEvent {
@@ -769,13 +791,19 @@ async fn run_request_stream(
                         timestamp: scheduled_at_unix_s,
                     },
                 ]);
+                let cached_tokens = cached_tokens as u32;
                 first_token_prefill_stats = Some(PrefillStats {
                     num_prompt_tokens: prompt_tokens as u32,
-                    num_computed_tokens: prompt_tokens as u32,
-                    num_cached_tokens: 0,
-                    num_local_cached_tokens: 0,
+                    num_computed_tokens: prompt_tokens.saturating_sub(cached_tokens as usize)
+                        as u32,
+                    num_cached_tokens: cached_tokens,
+                    num_local_cached_tokens: cached_tokens,
                     num_external_cached_tokens: 0,
                 });
+                cached_tokens_by_request_id
+                    .write()
+                    .await
+                    .insert(usage_request_id.clone(), cached_tokens);
             }
             TokenEvent::Token { id, logprob } => {
                 // Keep the first streamed token on the direct path so TTFT
@@ -994,14 +1022,14 @@ fn collect_ready_token_batch(
             Ok(other) => {
                 return (
                     token_ids,
-                    has_logprobs.then(|| MaybeWireLogprobs::Direct(Logprobs { positions })),
+                    has_logprobs.then_some(MaybeWireLogprobs::Direct(Logprobs { positions })),
                     Some(other),
                 );
             }
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
                 return (
                     token_ids,
-                    has_logprobs.then(|| MaybeWireLogprobs::Direct(Logprobs { positions })),
+                    has_logprobs.then_some(MaybeWireLogprobs::Direct(Logprobs { positions })),
                     None,
                 );
             }
@@ -1343,11 +1371,11 @@ mod tests {
         // ignore_eos=true lowering: _eos_token_id=None while
         // _all_stop_token_ids still carries the model EOS set.
         let mut params = EngineCoreSamplingParams::for_test();
-        params.all_stop_token_ids = BTreeSet::from([163586]);
+        params.all_stop_token_ids = BTreeSet::from([163_586]);
         assert!(convert_sampling(&params).ignore_eos);
 
         // Normal request: _eos_token_id present.
-        params.eos_token_id = Some(163586);
+        params.eos_token_id = Some(163_586);
         assert!(!convert_sampling(&params).ignore_eos);
 
         // Explicit client stop tokens keep EOS detection on even when the
@@ -1387,7 +1415,14 @@ mod tests {
             .expect("send rejected event");
         drop(token_tx);
 
-        run_request_stream("req-1".to_string(), token_rx, output_tx).await;
+        run_request_stream(
+            "req-1".to_string(),
+            "req-1".to_string(),
+            token_rx,
+            output_tx,
+            Arc::new(RwLock::new(HashMap::new())),
+        )
+        .await;
 
         let outputs = output_rx.recv().await.expect("terminal output");
         assert!(
@@ -1415,6 +1450,7 @@ mod tests {
 
         token_tx
             .send(TokenEvent::Scheduled {
+                cached_tokens: 0,
                 queued_at_unix_s: 1.0,
                 scheduled_at_unix_s: 2.0,
                 prompt_tokens: 16,
@@ -1447,7 +1483,14 @@ mod tests {
             .expect("send finished");
         drop(token_tx);
 
-        run_request_stream("req-1".to_string(), token_rx, output_tx).await;
+        run_request_stream(
+            "req-1".to_string(),
+            "req-1".to_string(),
+            token_rx,
+            output_tx,
+            Arc::new(RwLock::new(HashMap::new())),
+        )
+        .await;
 
         let token_outputs = output_rx.recv().await.expect("token output");
         assert_eq!(token_outputs.outputs.len(), 1);
@@ -1455,7 +1498,14 @@ mod tests {
         assert_eq!(token_outputs.outputs[0].new_token_ids, vec![11, 21]);
         assert!(token_outputs.outputs[0].finish_reason.is_none());
         assert!(token_outputs.outputs[0].events.is_some());
-        assert!(token_outputs.outputs[0].prefill_stats.is_some());
+        let prefill_stats = token_outputs.outputs[0]
+            .prefill_stats
+            .as_ref()
+            .expect("prefill stats");
+        assert_eq!(prefill_stats.num_cached_tokens, 0);
+        assert_eq!(prefill_stats.num_local_cached_tokens, 0);
+        assert_eq!(prefill_stats.num_external_cached_tokens, 0);
+        assert_eq!(prefill_stats.num_computed_tokens, 16);
 
         let direct = match token_outputs.outputs[0]
             .new_logprobs
@@ -1484,12 +1534,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scheduled_cached_tokens_are_passed_through_to_prefill_stats() {
+        let (token_tx, token_rx) = mpsc::unbounded_channel();
+        let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+
+        token_tx
+            .send(TokenEvent::Scheduled {
+                queued_at_unix_s: 1.0,
+                scheduled_at_unix_s: 2.0,
+                prompt_tokens: 10,
+                cached_tokens: 6,
+            })
+            .expect("send scheduled");
+        token_tx
+            .send(TokenEvent::Token {
+                id: 1,
+                logprob: None,
+            })
+            .expect("send first token");
+        drop(token_tx);
+
+        run_request_stream(
+            "req-cached".to_string(),
+            "req-cached".to_string(),
+            token_rx,
+            output_tx,
+            Arc::new(RwLock::new(HashMap::new())),
+        )
+        .await;
+
+        let first_batch = output_rx.recv().await.expect("first batch");
+        let prefill_stats = first_batch.outputs[0]
+            .prefill_stats
+            .as_ref()
+            .expect("prefill stats");
+        assert_eq!(prefill_stats.num_prompt_tokens, 10);
+        assert_eq!(prefill_stats.num_computed_tokens, 4);
+        assert_eq!(prefill_stats.num_cached_tokens, 6);
+        assert_eq!(prefill_stats.num_local_cached_tokens, 6);
+        assert_eq!(prefill_stats.num_external_cached_tokens, 0);
+    }
+
+    #[tokio::test]
     async fn first_token_metadata_is_only_sent_with_first_batch() {
         let (token_tx, token_rx) = mpsc::unbounded_channel();
         let (output_tx, mut output_rx) = mpsc::unbounded_channel();
 
         token_tx
             .send(TokenEvent::Scheduled {
+                cached_tokens: 0,
                 queued_at_unix_s: 1.0,
                 scheduled_at_unix_s: 2.0,
                 prompt_tokens: 8,
@@ -1515,7 +1608,14 @@ mod tests {
             .expect("send second token");
         drop(token_tx);
 
-        run_request_stream("req-2".to_string(), token_rx, output_tx).await;
+        run_request_stream(
+            "req-2".to_string(),
+            "req-2".to_string(),
+            token_rx,
+            output_tx,
+            Arc::new(RwLock::new(HashMap::new())),
+        )
+        .await;
 
         let first_batch = output_rx.recv().await.expect("first batch");
         let second_batch = output_rx.recv().await.expect("second batch");
@@ -1550,7 +1650,14 @@ mod tests {
             .expect("send token with logprob");
         drop(token_tx);
 
-        run_request_stream("req-3".to_string(), token_rx, output_tx).await;
+        run_request_stream(
+            "req-3".to_string(),
+            "req-3".to_string(),
+            token_rx,
+            output_tx,
+            Arc::new(RwLock::new(HashMap::new())),
+        )
+        .await;
 
         let batch = output_rx.recv().await.expect("batched output");
         let direct = match batch.outputs[0]

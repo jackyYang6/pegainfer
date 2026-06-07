@@ -134,6 +134,7 @@ pub enum TokenEvent {
         queued_at_unix_s: f64,
         scheduled_at_unix_s: f64,
         prompt_tokens: usize,
+        cached_tokens: usize,
     },
     Token {
         id: u32,

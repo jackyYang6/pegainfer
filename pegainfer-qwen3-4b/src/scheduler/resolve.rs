@@ -1,7 +1,7 @@
 use crate::executor::{DecodeRequestResult, ModelExecutor, PrefillRequestResult};
 use pegainfer_core::engine::FinishReason;
 
-use super::effects::{DecodeEffect, PendingEffect, PromptEchoEffect, StepEffects};
+use super::effects::{DecodeEffect, PendingEffect, PromptEchoEffect, ScheduledEffect, StepEffects};
 use super::plan::ExecutionArtifacts;
 use super::{ActiveRequestState, PendingRequest};
 
@@ -15,7 +15,6 @@ pub(super) fn resolve_step(
             resolve_prefill_outputs(executor, pending, result.requests)
         }
         ExecutionArtifacts::Decode { result } => StepEffects {
-            prompt_echoes: Vec::new(),
             pending: Vec::new(),
             decode: resolve_decode_outputs(executor, active, &result.requests),
         },
@@ -36,23 +35,28 @@ fn resolve_prefill_outputs(
     for (req, result) in pending.into_iter().zip(request_results) {
         debug_assert_eq!(req.request_id, result.request_id);
         let prompt_len = req.prompt_tokens.len();
+        let scheduled_at_unix_s = req.scheduled_at_unix_s.unwrap_or_else(super::now_secs_f64);
+        let scheduled = ScheduledEffect {
+            queued_at_unix_s: req.queued_at_unix_s.unwrap_or(scheduled_at_unix_s),
+            scheduled_at_unix_s,
+            prompt_tokens: prompt_len,
+            cached_tokens: result.cached_tokens,
+        };
 
-        if req.echo {
-            effects.prompt_echoes.push(PromptEchoEffect {
-                token_tx: req.token_tx.clone(),
-                ids: req.prompt_tokens.clone(),
-                logprobs: result
-                    .prompt_logprobs
-                    .unwrap_or_else(|| vec![None; req.prompt_tokens.len()]),
-            });
-        }
+        let prompt_echo = req.echo.then(|| PromptEchoEffect {
+            ids: req.prompt_tokens.clone(),
+            logprobs: result
+                .prompt_logprobs
+                .unwrap_or_else(|| vec![None; req.prompt_tokens.len()]),
+        });
 
         if !req.params.ignore_eos && executor.is_stop_token(result.first_token) {
             effects.pending.push(PendingEffect::Finish {
                 request_id: req.request_id,
                 token_tx: req.token_tx,
+                scheduled,
+                prompt_echo,
                 finish_reason: FinishReason::Stop,
-                prompt_tokens: prompt_len,
                 completion_tokens: 0,
             });
             continue;
@@ -62,10 +66,11 @@ fn resolve_prefill_outputs(
             effects.pending.push(PendingEffect::EmitAndFinish {
                 request_id: req.request_id,
                 token_tx: req.token_tx,
+                scheduled,
+                prompt_echo,
                 token: result.first_token,
                 logprob: result.first_token_logprob,
                 finish_reason: FinishReason::Length,
-                prompt_tokens: prompt_len,
                 completion_tokens: 1,
             });
             continue;
@@ -83,6 +88,8 @@ fn resolve_prefill_outputs(
                 params: req.params,
                 logprobs: req.logprobs,
             },
+            scheduled,
+            prompt_echo,
             first_token: result.first_token,
             logprob: result.first_token_logprob,
         });

@@ -12,6 +12,7 @@ pub struct SimulatedEngineConfig {
     prefill_tokens_per_ms: f64,
     tpot_ms: f64,
     fallback_token_id: u32,
+    scheduled_cached_tokens: usize,
 }
 
 impl SimulatedEngineConfig {
@@ -39,7 +40,14 @@ impl SimulatedEngineConfig {
             prefill_tokens_per_ms,
             tpot_ms,
             fallback_token_id,
+            scheduled_cached_tokens: 0,
         })
+    }
+
+    #[must_use]
+    pub fn with_scheduled_cached_tokens(mut self, cached_tokens: usize) -> Self {
+        self.scheduled_cached_tokens = cached_tokens;
+        self
     }
 
     fn ttft(&self, prompt_tokens: usize) -> Duration {
@@ -58,6 +66,7 @@ impl Default for SimulatedEngineConfig {
             prefill_tokens_per_ms: 100.0,
             tpot_ms: 12.0,
             fallback_token_id: 0,
+            scheduled_cached_tokens: 0,
         }
     }
 }
@@ -83,6 +92,7 @@ async fn run_simulated_request(req: GenerateRequest, config: SimulatedEngineConf
             queued_at_unix_s,
             scheduled_at_unix_s: now_secs_f64(),
             prompt_tokens: prompt_len,
+            cached_tokens: config.scheduled_cached_tokens.min(prompt_len),
         })
         .is_err()
     {

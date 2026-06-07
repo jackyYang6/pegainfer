@@ -25,7 +25,11 @@ struct SimServer {
 
 impl SimServer {
     async fn spawn() -> Result<Self> {
-        Self::spawn_with_model_dir(TempModelDir::with_minimal_metadata()?).await
+        Self::spawn_with_config(SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 1)?).await
+    }
+
+    async fn spawn_with_config(config: SimulatedEngineConfig) -> Result<Self> {
+        Self::spawn_with_model_dir_and_config(TempModelDir::with_minimal_metadata()?, config).await
     }
 
     async fn spawn_with_lora_routes() -> Result<Self> {
@@ -34,16 +38,40 @@ impl SimServer {
     }
 
     async fn spawn_with_model_dir(model_dir: TempModelDir) -> Result<Self> {
-        Self::spawn_with_model_dir_and_lora_routes(model_dir, false).await
+        Self::spawn_with_model_dir_and_config(
+            model_dir,
+            SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 1)?,
+        )
+        .await
+    }
+
+    async fn spawn_with_model_dir_and_config(
+        model_dir: TempModelDir,
+        config: SimulatedEngineConfig,
+    ) -> Result<Self> {
+        Self::spawn_with_model_dir_lora_routes_and_config(model_dir, false, config).await
     }
 
     async fn spawn_with_model_dir_and_lora_routes(
         model_dir: TempModelDir,
         enable_lora_routes: bool,
     ) -> Result<Self> {
+        Self::spawn_with_model_dir_lora_routes_and_config(
+            model_dir,
+            enable_lora_routes,
+            SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 1)?,
+        )
+        .await
+    }
+
+    async fn spawn_with_model_dir_lora_routes_and_config(
+        model_dir: TempModelDir,
+        enable_lora_routes: bool,
+        config: SimulatedEngineConfig,
+    ) -> Result<Self> {
         let mut last_error = None;
         for attempt in 1..=SERVER_START_ATTEMPTS {
-            match Self::spawn_once(&model_dir, enable_lora_routes).await {
+            match Self::spawn_once(&model_dir, enable_lora_routes, config).await {
                 Ok(started) => {
                     return Ok(Self {
                         base_url: started.base_url,
@@ -70,11 +98,12 @@ impl SimServer {
     async fn spawn_once(
         model_dir: &TempModelDir,
         enable_lora_routes: bool,
+        config: SimulatedEngineConfig,
     ) -> Result<StartedSimServer> {
         let port = reserve_loopback_port()?;
         let base_url = format!("http://127.0.0.1:{port}");
         let shutdown = CancellationToken::new();
-        let engine = start_engine(SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 1)?);
+        let engine = start_engine(config);
         let server_shutdown = shutdown.clone();
         let model_path = model_dir.path.to_string_lossy().into_owned();
         let mut task = tokio::spawn(async move {
@@ -251,6 +280,62 @@ async fn streaming_completion_emits_terminal_done() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_streaming_completion_reports_default_zero_cached_tokens() -> Result<()> {
+    let server = SimServer::spawn().await?;
+    let client = test_client()?;
+
+    let completion = post_completion(&client, &server.base_url, false).await?;
+    assert_usage_cached_tokens(&completion["usage"], 0)?;
+
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_streaming_completion_reports_configured_cached_tokens() -> Result<()> {
+    let cached_tokens = 1;
+    let server = SimServer::spawn_with_config(
+        SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 1)?
+            .with_scheduled_cached_tokens(cached_tokens),
+    )
+    .await?;
+    let client = test_client()?;
+
+    let completion = post_completion(&client, &server.base_url, false).await?;
+    assert_usage_cached_tokens(&completion["usage"], cached_tokens)?;
+
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_completion_reports_default_zero_cached_tokens_in_usage_chunk() -> Result<()> {
+    let server = SimServer::spawn().await?;
+    let client = test_client()?;
+
+    let stream = post_completion_stream(&client, &server.base_url, true).await?;
+    let usage = final_usage_chunk(&stream)?;
+    assert_usage_cached_tokens(&usage, 0)?;
+
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_completion_reports_configured_cached_tokens_in_usage_chunk() -> Result<()> {
+    let cached_tokens = 1;
+    let server = SimServer::spawn_with_config(
+        SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 1)?
+            .with_scheduled_cached_tokens(cached_tokens),
+    )
+    .await?;
+    let client = test_client()?;
+
+    let stream = post_completion_stream(&client, &server.base_url, true).await?;
+    let usage = final_usage_chunk(&stream)?;
+    assert_usage_cached_tokens(&usage, cached_tokens)?;
+
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn simulated_frontend_metadata_contract_is_executable() -> Result<()> {
     let model_dir = TempModelDir::with_minimal_metadata()?;
     for file in ["tokenizer.json", "tokenizer_config.json", "config.json"] {
@@ -308,7 +393,7 @@ async fn assert_non_streaming_completion_has_output(client: &Client, base_url: &
 }
 
 async fn assert_streaming_completion_emits_done(client: &Client, base_url: &str) -> Result<()> {
-    let stream = post_completion_stream(client, base_url).await?;
+    let stream = post_completion_stream(client, base_url, false).await?;
     if !stream.lines().any(|line| line.trim() == "data: [DONE]") {
         bail!("streaming completion did not emit terminal data: [DONE]: {stream}");
     }
@@ -320,7 +405,7 @@ async fn post_completion(client: &Client, base_url: &str, stream: bool) -> Resul
     let response = client
         .post(format!("{base_url}/v1/completions"))
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(completion_body(stream).to_string())
+        .body(completion_body(stream, false).to_string())
         .send()
         .await?
         .error_for_status()?;
@@ -330,11 +415,55 @@ async fn post_completion(client: &Client, base_url: &str, stream: bool) -> Resul
         .context("failed to parse non-streaming completion response")
 }
 
-async fn post_completion_stream(client: &Client, base_url: &str) -> Result<String> {
+fn assert_usage_cached_tokens(usage: &Value, expected_cached_tokens: usize) -> Result<()> {
+    let prompt_tokens = usage["prompt_tokens"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("usage has no prompt_tokens: {usage}"))?;
+    if prompt_tokens != 2 {
+        bail!("expected prompt_tokens=2, got {prompt_tokens}: {usage}");
+    }
+    let cached_tokens = usage["prompt_tokens_details"]["cached_tokens"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("usage has no prompt_tokens_details.cached_tokens: {usage}"))?;
+    if cached_tokens != expected_cached_tokens as u64 {
+        bail!("expected cached_tokens={expected_cached_tokens}, got {cached_tokens}: {usage}");
+    }
+
+    Ok(())
+}
+
+fn final_usage_chunk(stream: &str) -> Result<Value> {
+    let mut usage_chunks = Vec::new();
+    for line in stream.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data.trim() == "[DONE]" {
+            continue;
+        }
+        let chunk: Value = serde_json::from_str(data)
+            .with_context(|| format!("failed to parse SSE chunk JSON: {data}"))?;
+        if !chunk["usage"].is_null() {
+            usage_chunks.push(chunk["usage"].clone());
+        }
+    }
+
+    match usage_chunks.as_slice() {
+        [usage] => Ok(usage.clone()),
+        [] => bail!("stream did not include a usage chunk: {stream}"),
+        _ => bail!("stream included multiple usage chunks: {stream}"),
+    }
+}
+
+async fn post_completion_stream(
+    client: &Client,
+    base_url: &str,
+    include_usage: bool,
+) -> Result<String> {
     client
         .post(format!("{base_url}/v1/completions"))
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(completion_body(true).to_string())
+        .body(completion_body(true, include_usage).to_string())
         .send()
         .await?
         .error_for_status()?
@@ -350,15 +479,19 @@ fn test_client() -> Result<Client> {
         .context("failed to build HTTP test client")
 }
 
-fn completion_body(stream: bool) -> Value {
-    json!({
+fn completion_body(stream: bool, include_usage: bool) -> Value {
+    let mut body = json!({
         "model": MODEL_NAME,
         "prompt": [1, 2],
         "max_tokens": 3,
         "temperature": 0.0,
         "ignore_eos": true,
         "stream": stream
-    })
+    });
+    if stream && include_usage {
+        body["stream_options"] = json!({ "include_usage": true });
+    }
+    body
 }
 
 async fn wait_for_health(client: &Client, base_url: &str) -> Result<()> {
