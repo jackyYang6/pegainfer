@@ -8,7 +8,7 @@ use crate::executor::{
     PrefillStepItem, UnifiedPlan, UnifiedResult,
 };
 
-use super::{ActiveRequestState, PendingRequest};
+use super::{ActiveRequestState, PendingRequest, now_secs_f64};
 
 pub(super) enum ExecutionPlan {
     Prefill { pending: Vec<PendingRequest> },
@@ -74,7 +74,8 @@ pub(super) fn execute_plan(
     rng: &mut StdRng,
 ) -> Result<ExecutionArtifacts> {
     match plan {
-        ExecutionPlan::Prefill { pending } => {
+        ExecutionPlan::Prefill { mut pending } => {
+            mark_scheduled(&mut pending);
             let mut result = PrefillResult {
                 requests: Vec::with_capacity(pending.len()),
             };
@@ -106,7 +107,8 @@ pub(super) fn execute_plan(
             sort_decode_results(&mut result.requests);
             Ok(ExecutionArtifacts::Decode { result })
         }
-        ExecutionPlan::Unified { pending } => {
+        ExecutionPlan::Unified { mut pending } => {
+            mark_scheduled(&mut pending);
             let mut result = UnifiedResult {
                 prefill_requests: Vec::with_capacity(pending.len()),
                 decode_requests: Vec::with_capacity(active.len()),
@@ -155,6 +157,13 @@ pub(super) fn execute_plan(
             sort_decode_results(&mut result.decode_requests);
             Ok(ExecutionArtifacts::Unified { pending, result })
         }
+    }
+}
+
+fn mark_scheduled(pending: &mut [PendingRequest]) {
+    let scheduled_at = now_secs_f64();
+    for req in pending {
+        req.scheduled_at_unix_s = Some(scheduled_at);
     }
 }
 
@@ -252,6 +261,8 @@ mod tests {
         PendingRequest {
             request_id: RequestId::new(0),
             lora_adapter: None,
+            queued_at_unix_s: None,
+            scheduled_at_unix_s: None,
             prompt_tokens: vec![1, 2, 3],
             params: SamplingParams::default(),
             max_tokens: 8,

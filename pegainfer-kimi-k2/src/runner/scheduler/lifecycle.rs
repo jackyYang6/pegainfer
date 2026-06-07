@@ -95,6 +95,7 @@ pub(in crate::runner) fn send_scheduled(req: &GenerateRequest) {
         queued_at_unix_s: req.queued_at_unix_s.unwrap_or(scheduled_at),
         scheduled_at_unix_s: scheduled_at,
         prompt_tokens: req.prompt_tokens.len(),
+        cached_tokens: 0,
     });
 }
 
