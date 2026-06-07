@@ -3,7 +3,7 @@
   "name": "00-bootstrap-guidelines",
   "title": "Bootstrap Guidelines",
   "description": "Fill in project development guidelines for AI agents",
-  "status": "in_progress",
+  "status": "completed",
   "dev_type": "docs",
   "scope": null,
   "package": null,
@@ -11,7 +11,7 @@
   "creator": "jackyYang6",
   "assignee": "jackyYang6",
   "createdAt": "2026-06-06",
-  "completedAt": null,
+  "completedAt": "2026-06-06",
   "branch": null,
   "base_branch": null,
   "worktree_path": null,
@@ -21,9 +21,8 @@
   "children": [],
   "parent": null,
   "relatedFiles": [
-    ".trellis/spec/pegainfer-server/",
-    ".trellis/spec/pegainfer-kernels/third_party/flashinfer/"
+    ".trellis/spec/pegainfer-server/"
   ],
-  "notes": "First-time setup task created by trellis init (backend project)",
+  "notes": "First-time setup task created by trellis init (backend project); flashinfer third-party specs intentionally ignored in this bootstrap pass",
   "meta": {}
 }

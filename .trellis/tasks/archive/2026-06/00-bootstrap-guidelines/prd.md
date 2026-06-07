@@ -21,9 +21,9 @@ the rest conversationally.
 
 ## Status (update the checkboxes as you complete each item)
 
-- [ ] Fill guidelines for pegainfer-server
-- [ ] Fill guidelines for pegainfer-kernels/third_party/flashinfer
-- [ ] Add code examples
+- [x] Fill guidelines for pegainfer-server (used as the pegainfer first-party workspace spec: server, vLLM frontend, core, kernels, model crates)
+- [x] Ignore pegainfer-kernels/third_party/flashinfer for this bootstrap pass per developer direction
+- [x] Add code examples
 
 ---
 
